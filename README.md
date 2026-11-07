@@ -36,6 +36,13 @@ environment. `ws run` runs the command directly, with its terminal, and returns 
 exit code. Inside a job or a lease, `ws run` just runs the command: that work is
 already accounted for.
 
+`gpu` is the old command, kept only while worktree scripts still call
+`~/projects/gpu-manager/gpu submit` (the folder is a symlink to this one). A job it
+submits, like every job submitted before the rename, keeps the old names: unit
+`gpu-job-N`, label `gpu-manager.job=N`, `GPU_JOB_*` env next to `WS_JOB_*`. It is
+counted as one core and no memory, and is neither pinned nor capped. Delete `gpu`,
+the symlink and `Job.legacy` once nothing calls them.
+
 Every pinned process gets `WS_JOB_CPUS` (its logical CPUs, e.g. `0,6,12,18`) and
 `WS_JOB_CORES`. `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` are
 set to the core count unless already set. Size worker pools from `WS_JOB_CORES`.
@@ -171,6 +178,7 @@ biasing vocabulary (~1.8k tokens for 4,000 characters); the worst case measured 
 | `workstation_manager/cpu.py` | core topology, the load meter, memory, pinning |
 | `workstation_manager/lease.py` | leases: what `ws run` and the pytest hook wait for |
 | `pytest_hook/ws_pytest.py` | the pytest plugin |
+| `gpu` | temporary: the old command, for callers not yet moved |
 | `workstation_manager/proxy.py` | the :8005/:8006 front door |
 | `workstation_manager/runner.py` | jobs as transient systemd user units (`ws-job-N`) |
 | `workstation_manager/board.py`, `page.py` | broker state for `ws status` and the status page |
