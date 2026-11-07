@@ -197,3 +197,28 @@ def thread_env(env: dict, cores: int, cpus: Sequence[int]) -> dict:
     for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         env.setdefault(k, str(cores))
     return env
+
+
+def container_ids(job_label: str) -> List[str]:
+    """Full ids of the running containers carrying a job's label."""
+    r = subprocess.run(["docker", "ps", "-q", "--no-trunc", "--filter", f"label={job_label}"],
+                       capture_output=True, text=True)
+    return r.stdout.split()
+
+
+def container_memory_mib(job_label: str) -> int:
+    """Memory in use by a job's containers. They run under Docker, outside the job's unit."""
+    total = 0
+    for cid in container_ids(job_label):
+        total += memory_current_mib(Path(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope")) or 0
+    return total
+
+
+def kernel_oom_kills(since: float, ids: Iterable[str]) -> bool:
+    """Whether the kernel log records an OOM kill in one of these containers since `since`."""
+    ids = [i for i in ids if i]
+    if not ids:
+        return False
+    r = subprocess.run(["journalctl", "-k", "--no-pager", "-o", "cat", "--since", f"@{int(since)}"],
+                       capture_output=True, text=True)
+    return any("oom" in l.lower() and any(f"docker-{i}" in l for i in ids) for l in r.stdout.splitlines())

@@ -148,6 +148,17 @@ def wrap(cfg: Config, job_id: int) -> int:
                     pass
         threading.Thread(target=reap, daemon=True).start()
 
+    # The job's containers run under Docker, outside this unit: note their ids while they
+    # run, so a kill at their --memory cap can be told from an ordinary failure.
+    started = time.time()
+    containers: set = set()
+    done = threading.Event()
+
+    def watch_containers():
+        while not done.wait(5):
+            containers.update(cpu.container_ids(label(job)))
+    threading.Thread(target=watch_containers, daemon=True).start()
+
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
     oom = False
@@ -159,8 +170,10 @@ def wrap(cfg: Config, job_id: int) -> int:
         if got:
             store.progress(job_id, chunk=got[0], chunks=got[1], pct=got[2])
     code = proc.wait()
+    done.set()
     stop_labelled_containers(label(job))
-    mem_oom = code != 0 and cpu.own_oom_kills() > oom_kills_before
+    mem_oom = code != 0 and (cpu.own_oom_kills() > oom_kills_before
+                             or cpu.kernel_oom_kills(started, containers))
     if mem_oom:
         log.write(f"== workstation-manager: killed at its memory limit ({job.mem_mib} MiB)\n".encode())
     log.write(f"== workstation-manager: exit {code} {time.strftime('%F %T')}\n".encode())
