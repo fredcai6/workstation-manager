@@ -1,15 +1,15 @@
-"""The broker loop: observe the card, ask the scheduler, apply its actions."""
+"""The broker loop: observe the card, the cores and memory, ask the scheduler, apply its actions."""
 
 from __future__ import annotations
 
 import logging
+import os
+import socket
 import threading
 import time
 from typing import Optional
 
-import os
-
-from . import board, interactive, page, proxy, runner, scheduler
+from . import board, cpu, interactive, page, proxy, runner, scheduler
 from .collector import collect
 from .config import Config
 from .store import ACTIVE, Store
@@ -45,6 +45,10 @@ class Daemon:
         self.svc_action: dict = {}
         self.svc_up_at: dict = {}
         self.page_at = 0.0
+        self.cores = cpu.topology()
+        self.meter = cpu.Meter(self.cores)
+        self.wake = threading.Event()
+        self.cgroups: dict = {}  # unit -> cgroup path
         # The hold runs from the owner's last assistant request, across restarts.
         self.gate.last_interactive_at = self.store.get_kv("last_interactive_at", 0.0)
 
@@ -71,6 +75,11 @@ class Daemon:
             elif res["exit_code"] == 0:
                 self.store.update(job.id, status="done", ended_at=now, exit_code=0)
                 self.store.event(job.id, "done")
+            elif res.get("mem_oom"):
+                self.store.update(job.id, status="failed", ended_at=now,
+                                  failures=job.failures + 1, exit_code=res["exit_code"])
+                self.store.event(job.id, f"killed at its memory limit ({job.mem_mib} MiB declared); "
+                                         "not retried (resubmit with more --mem)")
             elif res.get("oom"):
                 self.store.update(job.id, status="failed", ended_at=now,
                                   failures=job.failures + 1, exit_code=res["exit_code"])
@@ -88,6 +97,41 @@ class Daemon:
             if job.stop_request == "cancel":
                 self.store.update(job.id, status="cancelled", ended_at=time.time(), stop_request=None)
                 self.store.event(job.id, "cancelled while queued")
+
+    def reconcile_leases(self) -> None:
+        for lease in self.store.leases():
+            if not cpu.alive(lease.pid, lease.pid_start):
+                self.store.end_lease(lease.id)
+        self.store.prune_leases(time.time() - 86400)
+
+    def _cgroup(self, unit: str):
+        if unit not in self.cgroups:
+            path = cpu.unit_cgroup(unit)
+            if path is None or not path.exists():
+                return None
+            self.cgroups[unit] = path
+        return self.cgroups[unit]
+
+    def host_view(self, active, leases):
+        """The cores and memory as the scheduler sees them, and memory that holders have
+        declared but not yet used (it is about to leave MemAvailable)."""
+        busy = self.meter.sample()
+        total, available = cpu.meminfo()
+        unrealized = 0
+        for j in active:
+            if j.mem_mib:
+                used = cpu.memory_current_mib(self._cgroup(j.unit))
+                unrealized += max(0, j.mem_mib - (used or 0))
+        for l in leases:
+            if l.status != "granted":
+                continue
+            used = cpu.memory_current_mib(self._cgroup(l.unit)) if l.unit else None
+            unrealized += max(0, l.mem_mib - (used if used is not None else cpu.rss_mib(l.pid)))
+        live = {j.unit for j in active} | {l.unit for l in leases if l.unit}
+        self.cgroups = {u: p for u, p in self.cgroups.items() if u in live}
+        return (scheduler.CpuView([c.cpus for c in self.cores], list(busy), self.cfg.reserve_cores,
+                                   self.cfg.lease_reserve_cores),
+                scheduler.MemView(total, available, self.cfg.mem_margin_mib, unrealized))
 
     def observe_pair(self) -> None:
         if self.pair_action and self.pair_action.is_alive():
@@ -213,8 +257,13 @@ class Daemon:
     def apply(self, actions) -> None:
         for act in actions:
             kind = act[0]
-            if kind == "start_job":
+            if kind == "grant_lease":
+                self.store.grant_lease(act[1], act[2])
+            elif kind == "start_job":
                 job = self.store.get(act[1])
+                if len(act) > 2:
+                    self.store.update(job.id, cpus=act[2])
+                    job = self.store.get(job.id)
                 try:
                     runner.start(self.cfg, job)
                 except Exception as exc:
@@ -242,6 +291,7 @@ class Daemon:
     # -- loop -------------------------------------------------------------
     def tick(self) -> None:
         self.reconcile_jobs()
+        self.reconcile_leases()
         self.observe_pair()
         self.observe_services()
         # Cancels of running jobs go out before scheduling.
@@ -253,10 +303,13 @@ class Daemon:
         now = time.time()
         want = self.wanted_model(now)
         self.store.set_kv("last_interactive_at", self.gate.last_interactive_at)
+        active = self.store.jobs(ACTIVE)
+        leases = self.store.leases()
+        cpu_view, mem_view = self.host_view(active, leases)
         view = scheduler.View(
             now=time.time(),
             queued=[j for j in self.store.jobs(("queued",)) if j.stop_request != "cancel"],
-            active=self.store.jobs(ACTIVE),
+            active=active,
             pair=self.pair,
             last_interactive_at=self.gate.last_interactive_at,
             vram_total_mib=total, vram_used_mib=used,
@@ -265,6 +318,7 @@ class Daemon:
             loaded=self.gate.loaded, want=want,
             services=self.services_view(now),
             reserved=self.cfg.reserved(now),
+            cpu=cpu_view, mem=mem_view, leases=leases,
         )
         pair_busy = self.pair_action is not None and self.pair_action.is_alive()
         vram = {m.name: m.vram_mib for m in self.cfg.model_table().values()}
@@ -282,7 +336,15 @@ class Daemon:
                                      "model": self.gate.loaded, "want": want,
                                      "waiting_for": dict(self.gate.waiting_for),
                                      "services": {n: self.svc_state[n] for n in self.cfg.services},
-                                     "reserved": self.cfg.reserved(now)})
+                                     "reserved": self.cfg.reserved(now),
+                                     "cpu": {"cores": [list(c) for c in cpu_view.cores],
+                                             "busy": [round(b, 3) for b in cpu_view.busy],
+                                             "reserve": cpu_view.reserve,
+                                             "lease_reserve": cpu_view.lease_reserve},
+                                     "mem": {"total_mib": mem_view.total_mib,
+                                             "available_mib": mem_view.available_mib,
+                                             "margin_mib": mem_view.margin_mib,
+                                             "unrealized_mib": mem_view.unrealized_mib}})
 
     def publish_page(self) -> None:
         if time.time() - self.page_at < self.cfg.page_seconds:
@@ -301,6 +363,7 @@ class Daemon:
         proxy.serve(self.gate, self.cfg.listen, self.cfg.asr_port, self.cfg.asr_backend)
         for svc in self.cfg.services.values():
             proxy.serve(self.gate, self.cfg.listen, svc.port, svc.backend)
+        self.listen_for_wakes()
         self.store.event(None, "broker started")
         while True:
             try:
@@ -308,4 +371,22 @@ class Daemon:
                 self.publish_page()
             except Exception:
                 log.exception("tick")
-            time.sleep(self.cfg.tick_seconds)
+            self.wake.wait(self.cfg.tick_seconds)
+            self.wake.clear()
+
+    def listen_for_wakes(self) -> None:
+        """A lease request pokes the wake socket, so it is granted without waiting a tick."""
+        path = self.cfg.wake_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.bind(str(path))
+
+        def loop():
+            while True:
+                sock.recv(16)
+                self.wake.set()
+        threading.Thread(target=loop, daemon=True).start()

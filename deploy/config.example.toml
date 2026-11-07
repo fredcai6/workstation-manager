@@ -14,7 +14,7 @@
 # listen = ["127.0.0.1", "172.17.0.1", "172.18.0.1"]
 
 # Where the status page is written. Add a static site's directory to read it remotely.
-# page_dirs = ["~/.local/state/workstation-manager/page", "/srv/site/gpu-status"]
+# page_dirs = ["~/.local/state/workstation-manager/page", "/srv/site/workstation-status"]
 
 # Batch may take the card after this long without an assistant request (X-GPU-Hold: 1).
 # hold_minutes = 30
@@ -22,8 +22,23 @@
 # Daily windows (local time) when the interactive pair stays up with the default model.
 # reserve_windows = ["07:30-08:00"]
 
-# Headroom kept free on top of every job and the pair.
+# VRAM headroom kept free on top of every job and the pair.
 # margin_mib = 1024
+
+# Physical cores never handed to managed work (desktop, agents, the pair, the broker),
+# and cores batch never takes, kept for pytest runs and `ws run`.
+# reserve_cores = 2
+# lease_reserve_cores = 2
+
+# Memory kept free on top of every declared footprint (MemAvailable headroom).
+# mem_margin_mib = 8192
+
+# What a pytest run asks for unless it says otherwise; -n auto asks for pytest_auto_cores.
+# lease_cores = 1
+# lease_mem_mib = 2048
+# pytest_auto_cores = 4
+# A pytest run that has waited this long runs anyway, unpinned.
+# lease_wait_seconds = 900
 
 # Single model: the env file above and the pair's measured VRAM.
 # pair_vram_mib = 30000

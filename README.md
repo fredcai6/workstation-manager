@@ -1,24 +1,62 @@
-# gpu-manager
+# workstation-manager
 
-Shares one AMD GPU between an always-wanted interactive tier (a local LLM and a
-speech-recognition server) and batch jobs. A broker queues batch jobs, lends them
-the card when the interactive tier is idle, and fronts the LLM/ASR ports so callers
-wait instead of failing while the card is lent out. Python standard library only;
-Linux, AMDGPU, Docker and systemd user units.
+Shares this workstation between the work on it. A broker hands out physical CPU
+cores, memory and the AMD GPU: batch jobs wait in a queue, foreground work (pytest
+runs, `ws run`) takes a lease, and each runs pinned to its own cores with its memory
+declared. The GPU also has an always-wanted interactive tier (a local LLM and a
+speech-recognition server): the broker lends the card to batch when the tier is idle
+and fronts the LLM/ASR ports so callers wait instead of failing while it is lent
+out. Python standard library only; Linux, AMDGPU, Docker and systemd user units.
+
+Why cores: on this 12-core Ryzen 9900X, memory-bound fits ran fastest as four
+single-core jobs pinned to alternating CCDs (1201 passes/h). The usual overloaded
+state reached 750-900, and pinning to SMT siblings cost 35% (2026-10-15 sweep,
+`scratch/v35/perf/RESULTS_20261015.md`). Why memory: on 2026-10-30, 21 fits at
+~2.6 GB each ran the 59 GB box out of memory and restarted it.
 
 ## Using it
 
 ```
-gpu status [--json]                   card snapshot plus broker state
-gpu submit --vram 18G --name NAME -- CMD...
-gpu queue [--json]                    broker state only
-gpu cancel ID
-gpu log ID                            path of a job's log
-gpu take / gpu release                operator override: stop everything / resume
+ws status [--json]                    card, cores, memory, leases, queue
+ws submit --cores 4 --mem 8G [--vram 18G] --name NAME -- CMD...   queue a job
+ws run --cores 4 --mem 8G -- CMD...   run here, in the foreground, once it fits
+ws queue [--json]                     broker state only
+ws cancel ID
+ws log ID                             path of a job's log
+ws take / ws release                  operator override: stop everything / resume
 ```
 
-A submitted job runs from the directory it
-was submitted in, with the submitter's environment.
+`--cores` counts physical cores (default 1); each comes with both of its SMT
+siblings. `--mem` is peak memory and is required: it is enforced (MemoryMax, no
+swap), so a job or command that goes past it is killed, and a killed job is not
+retried. `--vram` (default none) makes it a GPU job.
+
+A submitted job runs from the directory it was submitted in, with the submitter's
+environment. `ws run` runs the command directly, with its terminal, and returns its
+exit code. Inside a job or a lease, `ws run` just runs the command: that work is
+already accounted for.
+
+Every pinned process gets `WS_JOB_CPUS` (its logical CPUs, e.g. `0,6,12,18`) and
+`WS_JOB_CORES`. `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` are
+set to the core count unless already set. Size worker pools from `WS_JOB_CORES`.
+
+### pytest
+
+Every pytest run on the machine takes a lease. `PYTEST_PLUGINS=ws_pytest`, with
+`pytest_hook/` on `PYTHONPATH` (both set in `~/.bashrc`), loads
+`pytest_hook/ws_pytest.py` in every venv. Before collection, the run waits for its
+cores and pins itself to them, and its xdist workers inherit them. The lease ends
+with the run.
+
+- It asks for 1 core and 2 GB. `-n N` asks for N cores, and `-n auto` asks for
+  `pytest_auto_cores` (4) and runs that many workers. `WS_PYTEST_CORES=3` and
+  `WS_PYTEST_MEM=8G` override.
+- A run that waits prints one line saying so; `ws status` shows who holds the cores.
+  After `lease_wait_seconds` (15 min) it runs anyway, unpinned, and says so. When
+  the broker is not running it runs unpinned at once.
+- No lease is taken for `--collect-only`, `--help`, xdist workers, runs inside a
+  job or lease, or with `WS_PYTEST=0` or `-p no:ws_pytest`. Memory is declared for
+  accounting only.
 
 ### The job contract
 
@@ -27,19 +65,47 @@ was submitted in, with the submitter's environment.
   same command.
 - **Stop on SIGTERM.** The job gets its grace period (`--grace`, default 60 s)
   before SIGKILL.
-- **Label containers:** add `--label "$GPU_JOB_LABEL"` to `docker run`, so a
-  stopped job cannot leave a container holding VRAM.
-- **Declare peak VRAM** with `--vram`. A job starts only when both the measured
-  free VRAM and the declared budget have room.
+- **Declare cores, memory and VRAM** with `--cores`, `--mem` and `--vram`. A job
+  starts only when the declared budget and the measurements both have room.
+- **Containers:** add `--label "$WS_JOB_LABEL"` to `docker run`, so a stopped job
+  cannot leave a container holding VRAM. Also add `--cpuset-cpus "$WS_JOB_CPUS"`
+  and `--memory "${WS_JOB_MEM_MIB}m"`: a container runs under Docker, not in the
+  job's unit, so the job's pinning and memory cap do not reach it.
 - **Report progress** by printing `chunk N/M` (optionally with `NN%`) on a line, or
-  by calling `gpu progress --chunk N/M --pct P`. Keep chunks under 4 hours.
+  by calling `ws progress --chunk N/M --pct P`. Keep chunks under 4 hours.
 - **Failures:** a failing exit is retried up to `--retries` times (default 2).
-  A stop, a reboot or a power loss is an interruption: the job goes back to the
-  front of the queue, and it doesn't count as a failure.
+  Running out of declared memory or VRAM is not retried. A stop, a reboot or a power
+  loss is an interruption: the job goes back to the front of the queue, and it
+  doesn't count as a failure.
 
-The status page shows the card, who holds its VRAM, each running job's progress and
-last output line, the queue, finished jobs and the last day of events. The broker
-rewrites it every 30 s into each directory in `page_dirs`.
+The status page shows the card and who holds its VRAM, each core and who holds it
+(or how busy unmanaged work keeps it), memory by holder, the leases, each running
+job's progress and last output line, the queue, finished jobs and the last day of
+events. The broker rewrites it every 30 s into each directory in `page_dirs`.
+
+## How cores and memory are shared
+
+- **Physical cores, alternating CCDs.** A holder gets whole cores, least busy first,
+  in the order 0, 6, 1, 7, ... (each with its sibling, 12, 18, 13, 19, ...).
+  Pinning is CPU affinity only: nothing stops unmanaged processes from running on a
+  held core.
+- **Room.** `reserve_cores` (2) are never handed out: they are left for the desktop,
+  agents, the interactive pair and the broker. `lease_reserve_cores` (2) are kept
+  for leases: batch never takes them. A batch job also counts cores that unmanaged
+  work keeps busy (smoothed over about 30 s) against its room, so it waits rather
+  than piling onto an overloaded box. A lease has a caller waiting and counts
+  declarations only.
+- **Memory.** A holder starts only when its declaration fits both the budget
+  (MemTotal less `mem_margin_mib`, 8 GB) and what is measured: MemAvailable less the
+  margin, less memory running holders have declared but not yet used.
+- **Order.** Leases go first, first come first served, even during a take: they hold
+  no VRAM. Then jobs, first come first served. A later job may start ahead of the
+  head only if the head would still fit once running work is gone, in every
+  resource the later job uses. A CPU-only job neither waits for the pair nor sends
+  it away.
+- **Wake-ups.** A new lease or job pokes the broker's socket (`wake.sock` in the
+  state dir), so a lease is granted on the next tick, about a second later, instead
+  of after the 5 s wait.
 
 ## How the card is shared
 
@@ -100,26 +166,32 @@ biasing vocabulary (~1.8k tokens for 4,000 characters); the worst case measured 
 
 | Path | What |
 |---|---|
-| `gpu_manager/scheduler.py` | the scheduling rules, as one pure function |
-| `gpu_manager/daemon.py` | the broker loop (`gpu daemon`) |
-| `gpu_manager/proxy.py` | the :8005/:8006 front door |
-| `gpu_manager/runner.py` | jobs as transient systemd user units (`gpu-job-N`) |
-| `gpu_manager/board.py`, `page.py` | broker state for `gpu status` and the status page |
-| `gpu_manager/store.py` | state in `~/.local/state/gpu-manager/broker.db` |
-| `gpu_manager/config.py` | defaults; override in `~/.config/gpu-manager/config.toml` |
+| `workstation_manager/scheduler.py` | the scheduling rules, as one pure function |
+| `workstation_manager/daemon.py` | the broker loop (`ws daemon`) |
+| `workstation_manager/cpu.py` | core topology, the load meter, memory, pinning |
+| `workstation_manager/lease.py` | leases: what `ws run` and the pytest hook wait for |
+| `pytest_hook/ws_pytest.py` | the pytest plugin |
+| `workstation_manager/proxy.py` | the :8005/:8006 front door |
+| `workstation_manager/runner.py` | jobs as transient systemd user units (`ws-job-N`) |
+| `workstation_manager/board.py`, `page.py` | broker state for `ws status` and the status page |
+| `workstation_manager/store.py` | state in `~/.local/state/workstation-manager/broker.db` |
+| `workstation_manager/config.py` | defaults; override in `~/.config/workstation-manager/config.toml` |
 | `interactive/docker-compose.yml` | the pair, plus `gate`, which holds the `llm`/`asr` names on Journal's network |
 | `interactive/check-journal.sh` | end-to-end chat and voice-note check through Journal |
-| `deploy/gpu-manager.service` | systemd user unit |
-| `deploy/config.example.toml` | every setting, for `~/.config/gpu-manager/config.toml` |
+| `deploy/workstation-manager.service` | systemd user unit |
+| `deploy/config.example.toml` | every setting, for `~/.config/workstation-manager/config.toml` |
 
 ## Setup
 
 ```
-ln -s "$PWD/gpu" ~/.local/bin/gpu
-cp deploy/config.example.toml ~/.config/gpu-manager/config.toml   # then edit
-ln -s "$PWD/deploy/gpu-manager.service" ~/.config/systemd/user/
-systemctl --user enable --now gpu-manager
+ln -s "$PWD/ws" ~/.local/bin/ws
+cp deploy/config.example.toml ~/.config/workstation-manager/config.toml   # then edit
+ln -s "$PWD/deploy/workstation-manager.service" ~/.config/systemd/user/
+systemctl --user enable --now workstation-manager
 loginctl enable-linger "$USER"     # so the broker and jobs run without a login
+# every pytest run takes a lease (in ~/.bashrc, after the interactive guard):
+export PYTHONPATH="$HOME/projects/workstation-manager/pytest_hook${PYTHONPATH:+:$PYTHONPATH}"
+export PYTEST_PLUGINS=ws_pytest
 ```
 
 Start the pair once with `docker compose -f interactive/docker-compose.yml
@@ -129,16 +201,19 @@ Start the pair once with `docker compose -f interactive/docker-compose.yml
 ## Operating
 
 ```
-systemctl --user status gpu-manager        # broker
-journalctl --user -u gpu-manager -f
-systemctl --user restart gpu-manager       # jobs keep running; they are their own units
+systemctl --user status workstation-manager        # broker
+journalctl --user -u workstation-manager -f
+systemctl --user restart workstation-manager       # jobs keep running; they are their own units
 ```
 
 Restart the pair by hand only with the broker in a take, or it will undo you:
-`gpu take`, do the work, `gpu release`.
+`ws take`, do the work, `ws release`.
 
 ## Tests
 
 ```
 python3 -m pytest -q tests
 ```
+
+`tests/test_live.py` runs real systemd units, pinning and a pytest run through the
+hook against a private broker (its own state dir, the card stubbed).

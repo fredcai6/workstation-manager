@@ -12,7 +12,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .board import _ago
+from .board import _ago, core_holders, host_summary
+from .store import describe
 
 # Reference palette (dataviz skill): categorical slots in fixed order, status
 # roles reserved, light and dark surfaces.
@@ -52,6 +53,9 @@ margin-right:6px;vertical-align:1px;background:var(--ink3)}
 .st.good::before{background:var(--good)}.st.warning::before{background:var(--warning)}
 .st.critical::before{background:var(--critical)}
 .empty{color:var(--ink2);font-size:14px}
+.cores{display:grid;grid-template-columns:repeat(auto-fit,minmax(18px,1fr));gap:3px;margin-top:10px}
+.cores span{display:block;height:22px;border-radius:3px;background:var(--track);position:relative;overflow:hidden}
+.cores span b{position:absolute;left:0;right:0;bottom:0;background:var(--ink3)}
 """
 
 STATUS = {"done": "good", "failed": "critical", "cancelled": "", "running": "good",
@@ -106,6 +110,58 @@ def _usage(s: Dict[str, Any], pair_vram_mib: int) -> str:
     return f'<div class="bar" role="img" aria-label="VRAM by holder">{segs}</div><div class="legend">{legend}</div>'
 
 
+def _holder_colours(s: Dict[str, Any]) -> Dict[str, str]:
+    """Running jobs keep their slots from the VRAM bar; leases share slot 1's hue."""
+    out = {f"#{j['id']} {j['name']}": _job_colour(i) for i, j in enumerate(s["running"])}
+    for l in s.get("leases", ()):
+        out[f"lease #{l['id']} {l['name']}"] = "var(--s1)"
+    return out
+
+
+def _cores(s: Dict[str, Any]) -> str:
+    """One cell per physical core: the holder's colour, or grey filled to how busy
+    unmanaged work keeps it."""
+    holders = core_holders(s)
+    if not holders:
+        return '<div class="n">cores not reported yet</div>'
+    busy = ((s["broker"] or {}).get("cpu") or {}).get("busy") or [0.0] * len(holders)
+    colours = _holder_colours(s)
+    cells, legend = [], {}
+    for i, h in enumerate(holders):
+        if h:
+            c = colours.get(h, "var(--other)")
+            legend[h] = c
+            cells.append(f'<span style="background:{c}" title="core {i}: {_e(h)}"></span>')
+        else:
+            cells.append(f'<span title="core {i}: unmanaged, {100 * busy[i]:.0f}% busy">'
+                         f'<b style="height:{100 * busy[i]:.0f}%"></b></span>')
+    leg = "".join(f'<span><i style="background:{c}"></i>{_e(n)}</span>' for n, c in legend.items())
+    leg += '<span><i style="background:var(--ink3)"></i>unmanaged load</span>'
+    return f'<div class="cores" role="img" aria-label="cores by holder">{"".join(cells)}</div><div class="legend">{leg}</div>'
+
+
+def _memory(s: Dict[str, Any], h: Dict[str, Any]) -> str:
+    total, avail = h["mem_total_mib"], h["mem_available_mib"]
+    if not total:
+        return '<div class="n">memory not reported yet</div>'
+    colours = _holder_colours(s)
+    parts = [(f"#{j['id']} {j['name']}", j.get("mem_mib") or 0) for j in s["running"]]
+    parts += [(f"lease #{l['id']} {l['name']}", l["mem_mib"]) for l in s.get("leases", ())
+              if l["status"] == "granted"]
+    parts = [(n, m, colours.get(n, "var(--other)")) for n, m in parts if m]
+    used = total - avail
+    other = max(0, used - sum(m for _, m, _ in parts))
+    parts.append(("everything else in use", other, "var(--other)"))
+    free = max(0, total - sum(m for _, m, _ in parts))
+    segs = "".join(f'<span style="width:{100 * m / total:.2f}%;background:{c}" title="{_e(n)}: {_gb(m)}"></span>'
+                   for n, m, c in parts if m > 0)
+    segs += f'<span style="width:{100 * free / total:.2f}%;background:var(--track)" title="free: {_gb(free)}"></span>'
+    legend = "".join(f'<span><i style="background:{c}"></i>{_e(n)} {_gb(m)}</span>' for n, m, c in parts if m > 0)
+    legend += f'<span><i style="background:var(--track)"></i>free {_gb(free)}</span>'
+    return (f'<div class="bar" role="img" aria-label="memory by holder (declared)">{segs}</div>'
+            f'<div class="legend">{legend}</div>')
+
+
 def _progress(j, colour: str) -> str:
     pct = j.get("pct")
     if pct is None and j.get("chunks"):
@@ -143,6 +199,14 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
         out.append(f'<div class="tile" style="grid-column:1/-1"><div class="k">VRAM, {_e(b.get("card") or "GPU")}</div>'
                    f'<div class="v">{_gb(b.get("vram_used_mib"))} of {_gb(b.get("vram_total_mib"))}</div>'
                    f'<div class="n">GPU busy {"?" if busy is None else f"{busy}%"}</div>{_usage(s, pair_vram_mib)}</div>')
+        h = host_summary(s)
+        out.append(f'<div class="tile" style="grid-column:1/-1"><div class="k">Cores</div>'
+                   f'<div class="v">{h["held"]} of {h["cores"]} held</div>'
+                   f'<div class="n">~{h["unmanaged_busy"]:.1f} busy with unmanaged work · '
+                   f'{_e(h["reserve"])} always left to it</div>{_cores(s)}</div>')
+        out.append(f'<div class="tile" style="grid-column:1/-1"><div class="k">Memory</div>'
+                   f'<div class="v">{_gb(h["mem_available_mib"])} available of {_gb(h["mem_total_mib"])}</div>'
+                   f'<div class="n">holders shown at what they declared</div>{_memory(s, h)}</div>')
         out.append(f'<div class="tile"><div class="k">Interactive tier</div>'
                    f'<div class="v"><span class="st {pcls}">{_e(ptxt)}</span></div>'
                    f'<div class="n">{_e(b.get("model") or "")}'
@@ -164,15 +228,28 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                 log = f'<div class="log">last output {_ago(now - j["log_at"])} ago: {_e(j.get("log_last"))}</div>'
             out.append(
                 f'<div class="job"><div class="t"><span class="name">#{j["id"]} {_e(j["name"])}</span>'
-                f'<span class="muted">{_gb(j["vram_mib"])} · started {_ago(now - (j["started_at"] or now))} ago'
+                f'<span class="muted">{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"]))} · started {_ago(now - (j["started_at"] or now))} ago'
                 f'{" · " + _e(j["owner"]) if j["owner"] else ""}</span></div>'
                 f'{_progress(j, _job_colour(i))}{log}</div>')
+
+        out.append("<h2>Leases (pytest, ws run)</h2>")
+        if not s.get("leases"):
+            out.append('<p class="empty">None.</p>')
+        else:
+            out.append('<table><tr><th>Lease</th><th>Holds</th><th>State</th><th>Owner</th></tr>')
+            for l in s["leases"]:
+                when = l["granted_at"] if l["status"] == "granted" else l["requested_at"]
+                state = f'{"held" if l["status"] == "granted" else "waiting"} {_ago(now - when)}'
+                out.append(f'<tr><td>#{l["id"]} {_e(l["name"])}</td><td>{_e(describe(l["cores"], l["mem_mib"], 0))}</td>'
+                           f'<td><span class="st {"good" if l["status"] == "granted" else ""}">{state}</span></td>'
+                           f'<td>{_e(l["owner"])}</td></tr>')
+            out.append("</table>")
 
         out.append("<h2>Queue</h2>")
         if not s["queued"]:
             out.append('<p class="empty">Empty.</p>')
         else:
-            out.append('<table><tr><th>Job</th><th class="num">VRAM</th><th>Waiting</th><th>Notes</th><th>Owner</th></tr>')
+            out.append('<table><tr><th>Job</th><th>Needs</th><th>Waiting</th><th>Notes</th><th>Owner</th></tr>')
             for j in s["queued"]:
                 notes = []
                 if j["interruptions"]:
@@ -181,7 +258,7 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                     notes.append(f"{j['failures']} failed attempt(s)")
                 if j.get("chunks"):
                     notes.append(f"last at chunk {j['chunk']} of {j['chunks']}")
-                out.append(f'<tr><td>#{j["id"]} {_e(j["name"])}</td><td class="num">{_gb(j["vram_mib"])}</td>'
+                out.append(f'<tr><td>#{j["id"]} {_e(j["name"])}</td><td>{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"]))}</td>'
                            f'<td>{_ago(now - j["submitted_at"])}</td><td>{_e(", ".join(notes))}</td>'
                            f'<td>{_e(j["owner"])}</td></tr>')
             out.append("</table>")
@@ -212,8 +289,8 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<meta http-equiv="refresh" content="30"><meta name="robots" content="noindex">'
-            f'<title>GPU status</title><style>{CSS}</style></head><body><main>'
-            f'<h1>GPU status</h1><div class="sub">Updated {time.strftime("%a %b %d, %H:%M:%S", time.localtime(now))}'
+            f'<title>Workstation status</title><style>{CSS}</style></head><body><main>'
+            f'<h1>Workstation status</h1><div class="sub">Updated {time.strftime("%a %b %d, %H:%M:%S", time.localtime(now))}'
             f' · refreshes every 30 s</div>{body}</main></body></html>')
 
 

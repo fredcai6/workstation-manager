@@ -1,9 +1,9 @@
 [Unit]
-Description=GPU manager broker: batch queue and the :8005/:8006 front door
+Description=Workstation manager broker: queue and leases for cores, memory and the GPU; the :8005/:8006 front door
 
 [Service]
-# `gpu` on this path is a symlink to the repo's ./gpu.
-ExecStart=%h/.local/bin/gpu daemon
+# `ws` on this path is a symlink to the repo's ./ws.
+ExecStart=%h/.local/bin/ws daemon
 Restart=always
 # The bridge addresses it listens on appear when Docker starts; retry until they do.
 RestartSec=5

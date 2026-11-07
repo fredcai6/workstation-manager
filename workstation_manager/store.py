@@ -31,7 +31,27 @@ CREATE TABLE IF NOT EXISTS jobs (
     chunks INTEGER,
     pct REAL,
     progress_at REAL,
-    note TEXT
+    note TEXT,
+    cores INTEGER NOT NULL DEFAULT 1,
+    mem_mib INTEGER NOT NULL DEFAULT 0,
+    cpus TEXT
+);
+CREATE TABLE IF NOT EXISTS leases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    owner TEXT,
+    pid INTEGER NOT NULL,
+    pid_start INTEGER,
+    cores INTEGER NOT NULL,
+    mem_mib INTEGER NOT NULL,
+    cwd TEXT,
+    unit TEXT,
+    status TEXT NOT NULL,
+    requested_at REAL NOT NULL,
+    granted_at REAL,
+    ended_at REAL,
+    cpus TEXT
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
@@ -40,6 +60,9 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 ACTIVE = ("running", "stopping")
+# Columns added after the first schema, with their definitions, for older databases.
+JOB_COLUMNS = {"cores": "INTEGER NOT NULL DEFAULT 1", "mem_mib": "INTEGER NOT NULL DEFAULT 0",
+               "cpus": "TEXT"}
 
 
 @dataclasses.dataclass
@@ -65,6 +88,9 @@ class Job:
     pct: Optional[float]
     progress_at: Optional[float]
     note: Optional[str]
+    cores: int = 1                  # physical cores
+    mem_mib: int = 0                # peak memory, enforced as the unit's MemoryMax
+    cpus: Optional[List[int]] = None  # logical CPUs it was given when started
 
     @property
     def unit(self) -> str:
@@ -72,6 +98,32 @@ class Job:
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass
+class Lease:
+    id: int
+    kind: str                       # pytest | run
+    name: str
+    owner: Optional[str]
+    pid: int
+    pid_start: Optional[int]
+    cores: int
+    mem_mib: int
+    cwd: Optional[str]
+    unit: Optional[str]             # the scope `ws run` puts its command in
+    status: str                     # waiting | granted | done
+    requested_at: float
+    granted_at: Optional[float]
+    ended_at: Optional[float]
+    cpus: Optional[List[int]]
+
+
+def describe(cores: int, mem_mib: int, vram_mib: int) -> str:
+    bits = [f"{cores} core{'s' if cores != 1 else ''}", f"{mem_mib / 1024:.1f} GB"]
+    if vram_mib:
+        bits.append(f"{vram_mib / 1024:.1f} GB VRAM")
+    return ", ".join(bits)
 
 
 class Store:
@@ -82,21 +134,27 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(jobs)")}
+        for col, ddl in JOB_COLUMNS.items():
+            if col not in have:
+                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
 
     # -- jobs -------------------------------------------------------------
     def submit(self, name, owner, vram_mib, argv, cwd, retries, grace_seconds,
-               now=None) -> int:
+               now=None, cores=1, mem_mib=0) -> int:
         now = time.time() if now is None else now
         cur = self.db.execute(
             "INSERT INTO jobs (name, owner, vram_mib, argv, cwd, retries, grace_seconds,"
-            " status, submitted_at) VALUES (?,?,?,?,?,?,?, 'queued', ?)",
-            (name, owner, vram_mib, json.dumps(argv), cwd, retries, grace_seconds, now))
-        self.event(cur.lastrowid, f"submitted ({vram_mib} MiB)", now)
+            " status, submitted_at, cores, mem_mib) VALUES (?,?,?,?,?,?,?, 'queued', ?,?,?)",
+            (name, owner, vram_mib, json.dumps(argv), cwd, retries, grace_seconds, now,
+             cores, mem_mib))
+        self.event(cur.lastrowid, f"submitted ({describe(cores, mem_mib, vram_mib)})", now)
         return cur.lastrowid
 
     def _job(self, row) -> Job:
         d = dict(row)
         d["argv"] = json.loads(d["argv"])
+        d["cpus"] = json.loads(d["cpus"]) if d.get("cpus") else None
         return Job(**d)
 
     def get(self, job_id: int) -> Optional[Job]:
@@ -119,6 +177,8 @@ class Store:
         return [self._job(r) for r in rows]
 
     def update(self, job_id: int, **fields) -> None:
+        if "cpus" in fields and fields["cpus"] is not None:
+            fields["cpus"] = json.dumps(fields["cpus"])
         cols = ", ".join(f"{k}=?" for k in fields)
         self.db.execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
 
@@ -129,6 +189,42 @@ class Store:
             if v is not None:
                 fields[k] = v
         self.update(job_id, **fields)
+
+    # -- leases: foreground work (pytest, `ws run`) holding cores while it runs --
+    def request_lease(self, kind, name, owner, pid, pid_start, cores, mem_mib, cwd,
+                      unit=None, now=None) -> int:
+        cur = self.db.execute(
+            "INSERT INTO leases (kind, name, owner, pid, pid_start, cores, mem_mib, cwd, unit,"
+            " status, requested_at) VALUES (?,?,?,?,?,?,?,?,?, 'waiting', ?)",
+            (kind, name, owner, pid, pid_start, cores, mem_mib, cwd, unit,
+             time.time() if now is None else now))
+        return cur.lastrowid
+
+    def lease(self, lease_id: int) -> Optional[Lease]:
+        row = self.db.execute("SELECT * FROM leases WHERE id=?", (lease_id,)).fetchone()
+        return self._lease(row) if row else None
+
+    def leases(self, statuses=("waiting", "granted")) -> List[Lease]:
+        q = "SELECT * FROM leases WHERE status IN (%s) ORDER BY requested_at, id" % (
+            ",".join("?" * len(statuses)))
+        return [self._lease(r) for r in self.db.execute(q, tuple(statuses)).fetchall()]
+
+    def _lease(self, row) -> Lease:
+        d = dict(row)
+        d["cpus"] = json.loads(d["cpus"]) if d.get("cpus") else None
+        return Lease(**d)
+
+    def grant_lease(self, lease_id: int, cpus, now=None) -> None:
+        self.db.execute("UPDATE leases SET status='granted', granted_at=?, cpus=? WHERE id=?"
+                        " AND status='waiting'",
+                        (time.time() if now is None else now, json.dumps(list(cpus)), lease_id))
+
+    def end_lease(self, lease_id: int, now=None) -> None:
+        self.db.execute("UPDATE leases SET status='done', ended_at=? WHERE id=? AND status!='done'",
+                        (time.time() if now is None else now, lease_id))
+
+    def prune_leases(self, before: float) -> None:
+        self.db.execute("DELETE FROM leases WHERE status='done' AND ended_at<?", (before,))
 
     # -- key/value and history ---------------------------------------------
     def get_kv(self, key: str, default=None):

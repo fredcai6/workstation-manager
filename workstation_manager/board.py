@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from .config import Config
-from .store import ACTIVE, Store
+from .store import ACTIVE, Store, describe
 
 
 def log_activity(cfg: Config, job_id: int) -> Dict[str, Any]:
@@ -39,8 +40,46 @@ def snapshot(cfg: Config, store: Store, now: float = None) -> Dict[str, Any]:
         "hold_seconds_left": hold_left,
         "running": [{**j.to_dict(), **log_activity(cfg, j.id)} for j in store.jobs(ACTIVE)],
         "queued": [j.to_dict() for j in store.jobs(("queued",))],
+        "leases": [dataclasses.asdict(l) for l in store.leases()],
         "recent": [j.to_dict() for j in store.recent(10)],
         "events": store.events(now - 86400),
+    }
+
+
+def core_holders(s: Dict[str, Any]) -> List[Optional[str]]:
+    """For each physical core, who holds it: "#N name", "lease #N name", or None."""
+    cpu = ((s.get("broker") or {}).get("cpu")) or {}
+    cores = cpu.get("cores") or []
+    where = {c: i for i, core in enumerate(cores) for c in core}
+    out: List[Optional[str]] = [None] * len(cores)
+    for j in s["running"]:
+        for c in j.get("cpus") or ():
+            if c in where:
+                out[where[c]] = f"#{j['id']} {j['name']}"
+    for l in s.get("leases", ()):
+        if l["status"] == "granted":
+            for c in l.get("cpus") or ():
+                if c in where:
+                    out[where[c]] = f"lease #{l['id']} {l['name']}"
+    return out
+
+
+def host_summary(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Cores held and the unmanaged load on the rest; memory declared and available."""
+    b = s.get("broker") or {}
+    cpu, mem = b.get("cpu") or {}, b.get("mem") or {}
+    holders = core_holders(s)
+    busy = cpu.get("busy") or []
+    granted = [l for l in s.get("leases", ()) if l["status"] == "granted"]
+    return {
+        "cores": len(holders),
+        "held": sum(1 for h in holders if h),
+        "unmanaged_busy": sum(b for b, h in zip(busy, holders) if not h),
+        "reserve": cpu.get("reserve"),
+        "mem_total_mib": mem.get("total_mib"),
+        "mem_available_mib": mem.get("available_mib"),
+        "mem_declared_mib": sum(j.get("mem_mib") or 0 for j in s["running"])
+                            + sum(l["mem_mib"] for l in granted),
     }
 
 
@@ -89,9 +128,25 @@ def render_text(s: Dict[str, Any]) -> str:
         out.append("  Reserve window: the pair stays up; big jobs wait")
     if b.get("services"):
         out.append("  On-demand: " + ", ".join(f"{n} {st}" for n, st in b["services"].items()))
+    h = host_summary(s)
+    if h["cores"]:
+        out.append(f"  Cores: {h['held']} of {h['cores']} held; ~{h['unmanaged_busy']:.1f} busy with "
+                   f"unmanaged work; {h['reserve']} always left to it")
+    if h["mem_total_mib"]:
+        out.append(f"  Memory: {h['mem_available_mib'] / 1024:.1f} GB available of "
+                   f"{h['mem_total_mib'] / 1024:.1f}; {h['mem_declared_mib'] / 1024:.1f} GB declared by holders")
+    leases = s.get("leases", ())
+    if leases:
+        out.append("  Leases (pytest, ws run):")
+    for l in leases:
+        when = l["granted_at"] if l["status"] == "granted" else l["requested_at"]
+        out.append(f"    lease #{l['id']} {l['name']}  {describe(l['cores'], l['mem_mib'], 0)}  "
+                   f"{'held' if l['status'] == 'granted' else 'waiting'} {_ago(now - when)}"
+                   + (f"  cpus {','.join(map(str, l['cpus']))}" if l.get("cpus") else "")
+                   + (f"  ({l['owner']})" if l["owner"] else ""))
     out.append("  Running:" if s["running"] else "  Running: none")
     for j in s["running"]:
-        out.append(f"    #{j['id']} {j['name']}  {j['vram_mib'] / 1024:.1f} GB  {j['status']}"
+        out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'])}  {j['status']}"
                    f"  {_progress(j)}  started {_ago(now - (j['started_at'] or now))} ago"
                    + (f"  ({j['owner']})" if j["owner"] else ""))
         if j.get("log_at"):
@@ -99,7 +154,7 @@ def render_text(s: Dict[str, Any]) -> str:
     out.append("  Queue:" if s["queued"] else "  Queue: empty")
     for j in s["queued"]:
         extra = f", {j['interruptions']} interruption(s)" if j["interruptions"] else ""
-        out.append(f"    #{j['id']} {j['name']}  {j['vram_mib'] / 1024:.1f} GB  waiting "
+        out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'])}  waiting "
                    f"{_ago(now - j['submitted_at'])}{extra}"
                    + (f"  ({j['owner']})" if j["owner"] else ""))
     return "\n".join(out)

@@ -21,6 +21,17 @@ Rules, in order:
 8. An on-demand service starts when a request waits for it and it fits, ahead of
    queued batch (a caller is waiting). It stops once idle for its limit, or at once
    when idle and its room is needed by a model swap or the head of the queue.
+9. Cores and memory are resources like VRAM. Every job and lease declares physical
+   cores and peak memory and starts only when both fit the declared budget (at least
+   `reserve` cores are always left to unmanaged work) and what is measured: memory
+   that running holders have declared but not yet used counts against
+   MemAvailable, and for batch jobs cores busy outside managed work count against
+   the room too. A lease has a caller waiting and skips that last check, and
+   `lease_reserve` cores are kept for leases: batch never takes them. A job gets whole physical cores, least busy first
+   in CCD-alternating order. The rules above about the card apply to jobs that
+   declare VRAM; a CPU-only job neither waits for the pair nor sends it away.
+10. A lease (a foreground pytest or `ws run`: a caller is waiting) is granted ahead
+   of queued batch, first come first served, even during a take: it holds no VRAM.
 """
 
 from __future__ import annotations
@@ -28,11 +39,32 @@ from __future__ import annotations
 import dataclasses
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
-from .store import Job
+from .store import Job, Lease
 
 CROWDED_GRACE_SECONDS = 10.0
 
-Action = Tuple  # ("start_job", id) | ("stop_job", id, reason) | ("stop_pair",) | ("start_pair", model) | ("swap_model", model) | ("start_service", name) | ("stop_service", name)
+# ("start_job", id[, cpus]) | ("grant_lease", id, cpus) | ("stop_job", id, reason) |
+# ("stop_pair",) | ("start_pair", model) | ("swap_model", model) | ("start_service", name) |
+# ("stop_service", name). start_job carries cpus when the View has a CpuView.
+Action = Tuple
+
+
+@dataclasses.dataclass
+class CpuView:
+    """Physical cores in allocation order (each a tuple of logical CPUs), how busy
+    each is (0-1, smoothed), and how many are always left to unmanaged work."""
+    cores: Sequence[Tuple[int, ...]]
+    busy: Sequence[float]
+    reserve: int = 2
+    lease_reserve: int = 0          # cores batch never takes, so a pytest need not wait for it
+
+
+@dataclasses.dataclass
+class MemView:
+    total_mib: int
+    available_mib: int
+    margin_mib: int
+    unrealized_mib: int = 0         # declared by running holders, not yet in use
 
 
 @dataclasses.dataclass
@@ -62,6 +94,65 @@ class View:
     want: Optional[str] = None      # model it should run (None: the only/first one)
     services: Sequence[Svc] = ()
     reserved: bool = False          # inside a reserve window
+    cpu: Optional[CpuView] = None   # None: cores are not scheduled (tests of card rules)
+    mem: Optional[MemView] = None   # None: memory is not scheduled
+    leases: Sequence[Lease] = ()    # waiting and granted, in request order
+
+
+class Host:
+    """Room on the cores and in memory, updated as the decision hands it out."""
+
+    def __init__(self, v: View):
+        self.cpu, self.mem = v.cpu, v.mem
+        granted = [l for l in v.leases if l.status == "granted"]
+        holders = list(v.active) + granted
+        self.cores_committed = sum(h.cores for h in holders)
+        self.lease_cores = sum(l.cores for l in granted)
+        self.mem_committed = sum(h.mem_mib for h in holders)
+        if self.cpu:
+            where = {c: i for i, core in enumerate(self.cpu.cores) for c in core}
+            self.assigned = {where[c] for h in holders for c in (h.cpus or ()) if c in where}
+            unmanaged = sum(b for i, b in enumerate(self.cpu.busy) if i not in self.assigned)
+            self.cores_cap = len(self.cpu.cores) - self.cpu.reserve
+            # What batch may take: the reserve or the unmanaged load, whichever is more.
+            self.unmanaged_over = max(0, round(unmanaged) - self.cpu.reserve)
+        if self.mem:
+            self.mem_cap = self.mem.total_mib - self.mem.margin_mib
+            self.mem_room = min(self.mem_cap - self.mem_committed,
+                                self.mem.available_mib - self.mem.margin_mib - self.mem.unrealized_mib)
+
+    def fits(self, h, lease: bool = False) -> bool:
+        if self.cpu:
+            room = self.cores_cap - self.cores_committed
+            if not lease:
+                room -= self.unmanaged_over + max(0, self.cpu.lease_reserve - self.lease_cores)
+            if h.cores > room:
+                return False
+        return not self.mem or h.mem_mib <= self.mem_room
+
+    def leaves_room_for(self, h, head) -> bool:
+        """Whether starting `h` still lets `head` fit once running work is gone."""
+        if self.cpu and h.cores and self.cores_cap - (self.cores_committed + h.cores) < head.cores:
+            return False
+        if self.mem and h.mem_mib and self.mem_cap - (self.mem_committed + h.mem_mib) < head.mem_mib:
+            return False
+        return True
+
+    def take(self, h) -> Optional[List[int]]:
+        """Commit `h`; the logical CPUs it gets (None when cores are not scheduled)."""
+        self.cores_committed += h.cores
+        if isinstance(h, Lease):
+            self.lease_cores += h.cores
+        self.mem_committed += h.mem_mib
+        if self.mem:
+            self.mem_room -= h.mem_mib
+        if not self.cpu:
+            return None
+        free = [i for i in range(len(self.cpu.cores)) if i not in self.assigned]
+        free.sort(key=lambda i: (self.cpu.busy[i] >= 0.5, i))
+        got = free[:h.cores]
+        self.assigned.update(got)
+        return sorted(c for i in got for c in self.cpu.cores[i])
 
 
 def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minutes: float,
@@ -75,6 +166,16 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
 
     actions: List[Action] = []
     running = [j for j in v.active if j.status == "running"]
+    host = Host(v)
+
+    pending = [l for l in v.leases if l.status == "waiting"]
+    for lease in list(pending):
+        if not host.fits(lease, lease=True):
+            continue
+        if lease is not pending[0] and not host.leaves_room_for(lease, pending[0]):
+            continue
+        actions.append(("grant_lease", lease.id, host.take(lease) or []))
+        pending.remove(lease)
 
     if v.take:
         actions += [("stop_job", j.id, "requeue") for j in running]
@@ -139,20 +240,26 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
 
     waiting = list(v.queued)
     for job in v.queued:
-        if job.vram_mib > min(room, free):
+        if job.vram_mib > min(room, free) or not host.fits(job):
             continue
-        if job is not head and head in waiting and cap - (committed + job.vram_mib) < head.vram_mib:
+        if job is not head and head in waiting:
+            if job.vram_mib and cap - (committed + job.vram_mib) < head.vram_mib:
+                continue
+            if not host.leaves_room_for(job, head):
+                continue
+        if job.vram_mib and swap_blocked and cap - (committed + job.vram_mib) < want_mib:
             continue
-        if swap_blocked and cap - (committed + job.vram_mib) < want_mib:
+        if job.vram_mib and svc_need and cap - (committed + job.vram_mib) - pair_mib < svc_need:
             continue
-        if svc_need and cap - (committed + job.vram_mib) - pair_mib < svc_need:
-            continue
-        actions.append(("start_job", job.id))
+        cpus = host.take(job)
+        actions.append(("start_job", job.id) if cpus is None else ("start_job", job.id, cpus))
         waiting.remove(job)
         committed += job.vram_mib
         room -= job.vram_mib
         free -= job.vram_mib
 
+    # Only jobs that need the card keep the pair away or send it off.
+    waiting = [j for j in waiting if j.vram_mib > 0]
     if v.reserved:
         if v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
             actions.append(("start_pair", want))
