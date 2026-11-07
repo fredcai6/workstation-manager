@@ -146,7 +146,7 @@ def render_text(s: Dict[str, Any]) -> str:
                    + (f"  ({l['owner']})" if l["owner"] else ""))
     out.append("  Running:" if s["running"] else "  Running: none")
     for j in s["running"]:
-        out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'])}  {j['status']}"
+        out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  {j['status']}"
                    f"  {_progress(j)}  started {_ago(now - (j['started_at'] or now))} ago"
                    + (f"  ({j['owner']})" if j["owner"] else ""))
         if j.get("log_at"):
@@ -154,7 +154,7 @@ def render_text(s: Dict[str, Any]) -> str:
     out.append("  Queue:" if s["queued"] else "  Queue: empty")
     for j in s["queued"]:
         extra = f", {j['interruptions']} interruption(s)" if j["interruptions"] else ""
-        out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'])}  waiting "
+        out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  waiting "
                    f"{_ago(now - j['submitted_at'])}{extra}"
                    + (f"  ({j['owner']})" if j["owner"] else ""))
     return "\n".join(out)

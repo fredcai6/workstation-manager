@@ -228,7 +228,7 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                 log = f'<div class="log">last output {_ago(now - j["log_at"])} ago: {_e(j.get("log_last"))}</div>'
             out.append(
                 f'<div class="job"><div class="t"><span class="name">#{j["id"]} {_e(j["name"])}</span>'
-                f'<span class="muted">{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"]))} · started {_ago(now - (j["started_at"] or now))} ago'
+                f'<span class="muted">{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))} · started {_ago(now - (j["started_at"] or now))} ago'
                 f'{" · " + _e(j["owner"]) if j["owner"] else ""}</span></div>'
                 f'{_progress(j, _job_colour(i))}{log}</div>')
 
@@ -258,7 +258,7 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                     notes.append(f"{j['failures']} failed attempt(s)")
                 if j.get("chunks"):
                     notes.append(f"last at chunk {j['chunk']} of {j['chunks']}")
-                out.append(f'<tr><td>#{j["id"]} {_e(j["name"])}</td><td>{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"]))}</td>'
+                out.append(f'<tr><td>#{j["id"]} {_e(j["name"])}</td><td>{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))}</td>'
                            f'<td>{_ago(now - j["submitted_at"])}</td><td>{_e(", ".join(notes))}</td>'
                            f'<td>{_e(j["owner"])}</td></tr>')
             out.append("</table>")
