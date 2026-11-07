@@ -1,8 +1,10 @@
 """Run batch jobs as transient systemd user units, so they outlive broker restarts.
 
 The unit's main process is `ws _wrap <id>`. It restores the submitter's
-environment, runs the command in its own process group, tees output to the job
-log, reads `chunk N/M` and `NN%` progress from it, and records the exit code.
+environment, pins itself to the job's cores (the command inherits them), runs the
+command in its own process group, tees output to the job log, reads `chunk N/M` and
+`NN%` progress from it, and records the exit code. The unit's MemoryMax is the
+job's declared memory, with no swap; a kill at that limit is recorded as such.
 On SIGTERM it passes the signal to the job, waits the job's grace period, then
 kills the group and any container labelled `workstation-manager.job=<id>`.
 """
@@ -19,6 +21,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import cpu
 from .config import REPO, Config
 from .store import Job, Store
 
@@ -50,6 +53,12 @@ def start(cfg: Config, job: Job) -> None:
         f"--working-directory={job.cwd}",
         "-p", "KillMode=mixed",
         "-p", f"TimeoutStopSec={job.grace_seconds + 30}",
+        # A kill at MemoryMax takes the command, not the unit: the wrapper records it.
+        "-p", "OOMPolicy=continue",
+        # The wrapper reads the same config (and so the same state) as this broker.
+        *([f"--setenv=WORKSTATION_MANAGER_CONFIG={os.environ['WORKSTATION_MANAGER_CONFIG']}"]
+          if os.environ.get("WORKSTATION_MANAGER_CONFIG") else []),
+        *(["-p", f"MemoryMax={job.mem_mib}M", "-p", "MemorySwapMax=0"] if job.mem_mib else []),
         sys.executable, str(REPO / "ws"), "_wrap", str(job.id),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -102,7 +111,12 @@ def wrap(cfg: Config, job_id: int) -> int:
     d = cfg.job_dir(job_id)
     env = json.loads((d / "env.json").read_text())
     env.update(WS_JOB_ID=str(job_id), WS_JOB_LABEL=label(job_id),
-               WS_JOB_VRAM_MIB=str(job.vram_mib), PYTHONUNBUFFERED="1")
+               WS_JOB_VRAM_MIB=str(job.vram_mib), WS_JOB_MEM_MIB=str(job.mem_mib),
+               PYTHONUNBUFFERED="1")
+    if job.cpus:
+        cpu.pin_process(job.cpus)
+        env = cpu.thread_env(env, job.cores, job.cpus)
+    oom_kills_before = cpu.own_oom_kills()
     log = open(d / "log", "ab", buffering=0)
     log.write(f"\n== workstation-manager: start {time.strftime('%F %T')} attempt "
               f"{job.failures + job.interruptions + 1}\n".encode())
@@ -142,9 +156,12 @@ def wrap(cfg: Config, job_id: int) -> int:
             store.progress(job_id, chunk=got[0], chunks=got[1], pct=got[2])
     code = proc.wait()
     stop_labelled_containers(job_id)
+    mem_oom = code != 0 and cpu.own_oom_kills() > oom_kills_before
+    if mem_oom:
+        log.write(f"== workstation-manager: killed at its memory limit ({job.mem_mib} MiB)\n".encode())
     log.write(f"== workstation-manager: exit {code} {time.strftime('%F %T')}\n".encode())
     (d / "result.json").write_text(json.dumps(
-        {"exit_code": code, "at": time.time(), "oom": oom and code != 0}))
+        {"exit_code": code, "at": time.time(), "oom": oom and code != 0, "mem_oom": mem_oom}))
     return 0
 
 

@@ -96,6 +96,21 @@ class Config:
     page_seconds: float = 30.0
     default_retries: int = 2
     default_grace_seconds: int = 60
+    # Physical cores never handed to managed work: left for the desktop, agents, the
+    # interactive pair and this broker. Cores busy with unmanaged work also count
+    # against the room, so this is a floor.
+    reserve_cores: int = 2
+    # Physical cores batch jobs never take, kept for pytest runs and `ws run`.
+    lease_reserve_cores: int = 2
+    # Memory kept free on top of every declared footprint (MemAvailable headroom).
+    mem_margin_mib: int = 8192
+    # What a pytest run asks for unless it says otherwise (WS_PYTEST_CORES /
+    # WS_PYTEST_MEM, or -n N with xdist); -n auto asks for pytest_auto_cores.
+    lease_cores: int = 1
+    lease_mem_mib: int = 2048
+    pytest_auto_cores: int = 4
+    # A pytest run that has waited this long runs anyway, unpinned, and says so.
+    lease_wait_seconds: float = 900.0
 
     @property
     def db_path(self) -> Path:
@@ -128,6 +143,11 @@ class Config:
             if (start <= minute < end) if start <= end else (minute >= start or minute < end):
                 return True
         return False
+
+    @property
+    def wake_path(self) -> Path:
+        """Datagram socket the broker listens on, so a new request is seen at once."""
+        return self.state_dir / "wake.sock"
 
     def job_dir(self, job_id: int) -> Path:
         return self.state_dir / "jobs" / str(job_id)
