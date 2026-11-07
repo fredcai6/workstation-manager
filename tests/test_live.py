@@ -119,6 +119,22 @@ class TestLive(unittest.TestCase):
         self.assertEqual(leases[0].kind, "pytest")
         self.assertIsNotNone(leases[0].granted_at)
 
+    @unittest.skipUnless(shutil.which("docker") and subprocess.run(
+        ["docker", "image", "inspect", "alpine:latest"], capture_output=True).returncode == 0,
+        "needs docker and alpine:latest")
+    def test_container_killed_at_its_memory_cap_is_not_retried(self):
+        sh = Path(self.tmp.name) / "hog.sh"
+        sh.write_text('#!/bin/sh\nexec docker run --rm --label "$WS_JOB_LABEL" --cpuset-cpus "$WS_JOB_CPUS" '
+                      '--memory "${WS_JOB_MEM_MIB}m" --memory-swap "${WS_JOB_MEM_MIB}m" '
+                      'alpine:latest sh -c "sleep 8; tail /dev/zero"\n')
+        sh.chmod(0o755)
+        r = self.ws("submit", "--mem", "100M", "--name", "chog", "--", str(sh))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        j = self.wait_job(1, timeout=90)
+        self.assertEqual((j.status, j.failures), ("failed", 1))
+        events = [e["what"] for e in self.d.store.events(0)]
+        self.assertTrue(any("memory limit" in e for e in events), events)
+
     def test_ws_run_holds_a_lease_and_caps_memory(self):
         r = self.ws("run", "--cores", "1", "--mem", "200M", "--", sys.executable, "-c",
                     "import os; print(len(os.sched_getaffinity(0)), os.environ['WS_LEASE'])", timeout=60)

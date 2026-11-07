@@ -120,8 +120,9 @@ class Daemon:
         unrealized = 0
         for j in active:
             if j.mem_mib:
-                used = cpu.memory_current_mib(self._cgroup(j.unit))
-                unrealized += max(0, j.mem_mib - (used or 0))
+                used = (cpu.memory_current_mib(self._cgroup(j.unit)) or 0) \
+                    + cpu.container_memory_mib(runner.label(j))
+                unrealized += max(0, j.mem_mib - used)
         for l in leases:
             if l.status != "granted":
                 continue
