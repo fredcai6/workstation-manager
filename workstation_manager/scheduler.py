@@ -99,6 +99,12 @@ class View:
     leases: Sequence[Lease] = ()    # waiting and granted, in request order
 
 
+def cores_of(h) -> int:
+    """Cores a holder takes. A legacy job declared none: like any unmanaged process,
+    its load shows up as unmanaged instead."""
+    return 0 if getattr(h, "legacy", False) else h.cores
+
+
 class Host:
     """Room on the cores and in memory, updated as the decision hands it out."""
 
@@ -106,7 +112,7 @@ class Host:
         self.cpu, self.mem = v.cpu, v.mem
         granted = [l for l in v.leases if l.status == "granted"]
         holders = list(v.active) + granted
-        self.cores_committed = sum(h.cores for h in holders)
+        self.cores_committed = sum(cores_of(h) for h in holders)
         self.lease_cores = sum(l.cores for l in granted)
         self.mem_committed = sum(h.mem_mib for h in holders)
         if self.cpu:
@@ -122,7 +128,7 @@ class Host:
                                 self.mem.available_mib - self.mem.margin_mib - self.mem.unrealized_mib)
 
     def fits(self, h, lease: bool = False) -> bool:
-        if self.cpu:
+        if self.cpu and cores_of(h):
             room = self.cores_cap - self.cores_committed
             if not lease:
                 room -= self.unmanaged_over + max(0, self.cpu.lease_reserve - self.lease_cores)
@@ -132,7 +138,8 @@ class Host:
 
     def leaves_room_for(self, h, head) -> bool:
         """Whether starting `h` still lets `head` fit once running work is gone."""
-        if self.cpu and h.cores and self.cores_cap - (self.cores_committed + h.cores) < head.cores:
+        if self.cpu and cores_of(h) and \
+                self.cores_cap - (self.cores_committed + cores_of(h)) < cores_of(head):
             return False
         if self.mem and h.mem_mib and self.mem_cap - (self.mem_committed + h.mem_mib) < head.mem_mib:
             return False
@@ -140,7 +147,7 @@ class Host:
 
     def take(self, h) -> Optional[List[int]]:
         """Commit `h`; the logical CPUs it gets (None when cores are not scheduled)."""
-        self.cores_committed += h.cores
+        self.cores_committed += cores_of(h)
         if isinstance(h, Lease):
             self.lease_cores += h.cores
         self.mem_committed += h.mem_mib
@@ -148,6 +155,8 @@ class Host:
             self.mem_room -= h.mem_mib
         if not self.cpu:
             return None
+        if not cores_of(h):
+            return []
         free = [i for i in range(len(self.cpu.cores)) if i not in self.assigned]
         free.sort(key=lambda i: (self.cpu.busy[i] >= 0.5, i))
         got = free[:h.cores]

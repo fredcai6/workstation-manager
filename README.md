@@ -40,7 +40,8 @@ already accounted for.
 `~/projects/gpu-manager/gpu submit` (the folder is a symlink to this one). A job it
 submits, like every job submitted before the rename, keeps the old names: unit
 `gpu-job-N`, label `gpu-manager.job=N`, `GPU_JOB_*` env next to `WS_JOB_*`. It is
-counted as one core and no memory, and is neither pinned nor capped. Delete `gpu`,
+scheduled on VRAM alone, as before: it holds no cores (its load reads as unmanaged)
+and no memory, and is neither pinned nor capped. Delete `gpu`,
 the symlink and `Job.legacy` once nothing calls them.
 
 Every pinned process gets `WS_JOB_CPUS` (its logical CPUs, e.g. `0,6,12,18`) and
