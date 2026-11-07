@@ -1,13 +1,13 @@
 """Command-line entry point.
 
-  gpu status [--json]                    card snapshot plus broker state
-  gpu submit --vram 18G [--name N] -- CMD...
-  gpu queue                              broker state only
-  gpu cancel ID
-  gpu progress --chunk 2/4 [--pct 50]    from inside a job (uses $GPU_JOB_ID)
-  gpu log ID                             path of a job's log
-  gpu take / gpu release                 operator override
-  gpu daemon                             the broker itself (systemd user unit)
+  ws status [--json]                    card snapshot plus broker state
+  ws submit --vram 18G [--name N] -- CMD...
+  ws queue                              broker state only
+  ws cancel ID
+  ws progress --chunk 2/4 [--pct 50]    from inside a job (uses $WS_JOB_ID)
+  ws log ID                             path of a job's log
+  ws take / ws release                 operator override
+  ws daemon                             the broker itself (systemd user unit)
 """
 
 from __future__ import annotations
@@ -67,19 +67,19 @@ def cmd_queue(args, cfg) -> int:
 def cmd_submit(args, cfg) -> int:
     argv = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
     if not argv:
-        print("gpu submit: give the command after --", file=sys.stderr)
+        print("ws submit: give the command after --", file=sys.stderr)
         return 2
     from .daemon import pick_card
     card = pick_card(collect(budget_seconds=2.0).devices, cfg.pci_id)
     total = card.vram_total_bytes // (1024 * 1024) if card and card.vram_total_bytes else None
     if total is not None and args.vram > total - cfg.margin_mib:
-        print(f"gpu submit: {args.vram} MiB can never fit ({total} MiB card, "
+        print(f"ws submit: {args.vram} MiB can never fit ({total} MiB card, "
               f"{cfg.margin_mib} MiB margin)", file=sys.stderr)
         return 2
     from . import runner
     store = _store(cfg)
     name = args.name or os.path.basename(argv[0])
-    owner = args.owner or os.environ.get("GPU_OWNER") or getpass.getuser()
+    owner = args.owner or os.environ.get("WS_OWNER") or getpass.getuser()
     job_id = store.submit(name, owner, args.vram, argv, os.getcwd(),
                           cfg.default_retries if args.retries is None else args.retries,
                           cfg.default_grace_seconds if args.grace is None else args.grace)
@@ -92,7 +92,7 @@ def cmd_cancel(args, cfg) -> int:
     store = _store(cfg)
     job = store.get(args.id)
     if job is None or job.status in ("done", "failed", "cancelled"):
-        print(f"gpu cancel: no live job #{args.id}", file=sys.stderr)
+        print(f"ws cancel: no live job #{args.id}", file=sys.stderr)
         return 1
     store.update(job.id, stop_request="cancel")
     print(f"cancelling job #{job.id} ({job.status})")
@@ -100,15 +100,15 @@ def cmd_cancel(args, cfg) -> int:
 
 
 def cmd_progress(args, cfg) -> int:
-    job_id = args.job or os.environ.get("GPU_JOB_ID")
+    job_id = args.job or os.environ.get("WS_JOB_ID")
     if not job_id:
-        print("gpu progress: not inside a gpu job (no $GPU_JOB_ID); pass --job", file=sys.stderr)
+        print("ws progress: not inside a gpu job (no $WS_JOB_ID); pass --job", file=sys.stderr)
         return 2
     chunk = chunks = None
     if args.chunk:
         m = re.fullmatch(r"(\d+)/(\d+)", args.chunk)
         if not m:
-            print("gpu progress: --chunk N/M", file=sys.stderr)
+            print("ws progress: --chunk N/M", file=sys.stderr)
             return 2
         chunk, chunks = int(m.group(1)), int(m.group(2))
     _store(cfg).progress(int(job_id), chunk=chunk, chunks=chunks, pct=args.pct, note=args.note)
@@ -120,7 +120,7 @@ def cmd_take(args, cfg) -> int:
     store.set_kv("take", True)
     store.event(None, "operator take")
     print("taken: running jobs are stopped and requeued, the interactive pair is stopped, "
-          "nothing starts until `gpu release`")
+          "nothing starts until `ws release`")
     return 0
 
 
@@ -150,7 +150,7 @@ def cmd_wrap(args, cfg) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="gpu", description="GPU manager: batch queue and interactive tier for one AMD card.")
+    parser = argparse.ArgumentParser(prog="ws", description="GPU manager: batch queue and interactive tier for one AMD card.")
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("status", help="Card snapshot plus broker state.")
@@ -166,7 +166,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("submit", help="Queue a batch job.")
     p.add_argument("--vram", type=parse_vram, required=True, help="Peak VRAM, e.g. 18G.")
     p.add_argument("--name")
-    p.add_argument("--owner", help="Who submitted it (default $GPU_OWNER or user).")
+    p.add_argument("--owner", help="Who submitted it (default $WS_OWNER or user).")
     p.add_argument("--retries", type=int, help="Retries after a failing exit (default 2).")
     p.add_argument("--grace", type=int, help="Seconds between SIGTERM and SIGKILL (default 60).")
     p.add_argument("cmd", nargs=argparse.REMAINDER)

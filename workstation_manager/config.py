@@ -1,4 +1,4 @@
-"""Broker configuration: defaults, overridden by ~/.config/gpu-manager/config.toml."""
+"""Broker configuration: defaults, overridden by ~/.config/workstation-manager/config.toml."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ class Service:
 
 @dataclasses.dataclass(frozen=True)
 class Config:
-    state_dir: Path = Path.home() / ".local/state/gpu-manager"
+    state_dir: Path = Path.home() / ".local/state/workstation-manager"
     # The compute card's PCI address; unset means the AMD card with the most VRAM.
     pci_id: Optional[str] = None
     # Headroom kept free on top of every declared footprint.
@@ -92,7 +92,7 @@ class Config:
     drain_seconds: float = 120.0
     tick_seconds: float = 5.0
     # Directories the status page is written to (add a static site's directory to publish it).
-    page_dirs: Tuple[str, ...] = ("~/.local/state/gpu-manager/page",)
+    page_dirs: Tuple[str, ...] = ("~/.local/state/workstation-manager/page",)
     page_seconds: float = 30.0
     default_retries: int = 2
     default_grace_seconds: int = 60
@@ -135,7 +135,7 @@ class Config:
 
 def load(path: Optional[Path] = None) -> Config:
     path = path or Path(os.environ.get(
-        "GPU_MANAGER_CONFIG", Path.home() / ".config/gpu-manager/config.toml"))
+        "WORKSTATION_MANAGER_CONFIG", Path.home() / ".config/workstation-manager/config.toml"))
     if not Path(path).exists():
         return Config()
     raw = tomllib.loads(Path(path).read_text())

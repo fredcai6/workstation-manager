@@ -68,7 +68,7 @@ class Job:
 
     @property
     def unit(self) -> str:
-        return f"gpu-job-{self.id}"
+        return f"ws-job-{self.id}"
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)

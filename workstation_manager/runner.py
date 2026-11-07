@@ -1,10 +1,10 @@
 """Run batch jobs as transient systemd user units, so they outlive broker restarts.
 
-The unit's main process is `gpu _wrap <id>`. It restores the submitter's
+The unit's main process is `ws _wrap <id>`. It restores the submitter's
 environment, runs the command in its own process group, tees output to the job
 log, reads `chunk N/M` and `NN%` progress from it, and records the exit code.
 On SIGTERM it passes the signal to the job, waits the job's grace period, then
-kills the group and any container labelled `gpu-manager.job=<id>`.
+kills the group and any container labelled `workstation-manager.job=<id>`.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ OOM_RE = re.compile(r"RESOURCE_EXHAUSTED|out of memory|hipErrorOutOfMemory|HIP o
 
 
 def label(job_id: int) -> str:
-    return f"gpu-manager.job={job_id}"
+    return f"workstation-manager.job={job_id}"
 
 
 def save_env(cfg: Config, job_id: int, env: dict) -> None:
@@ -50,7 +50,7 @@ def start(cfg: Config, job: Job) -> None:
         f"--working-directory={job.cwd}",
         "-p", "KillMode=mixed",
         "-p", f"TimeoutStopSec={job.grace_seconds + 30}",
-        sys.executable, str(REPO / "gpu"), "_wrap", str(job.id),
+        sys.executable, str(REPO / "ws"), "_wrap", str(job.id),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
@@ -101,10 +101,10 @@ def wrap(cfg: Config, job_id: int) -> int:
     job = store.get(job_id)
     d = cfg.job_dir(job_id)
     env = json.loads((d / "env.json").read_text())
-    env.update(GPU_JOB_ID=str(job_id), GPU_JOB_LABEL=label(job_id),
-               GPU_JOB_VRAM_MIB=str(job.vram_mib), PYTHONUNBUFFERED="1")
+    env.update(WS_JOB_ID=str(job_id), WS_JOB_LABEL=label(job_id),
+               WS_JOB_VRAM_MIB=str(job.vram_mib), PYTHONUNBUFFERED="1")
     log = open(d / "log", "ab", buffering=0)
-    log.write(f"\n== gpu-manager: start {time.strftime('%F %T')} attempt "
+    log.write(f"\n== workstation-manager: start {time.strftime('%F %T')} attempt "
               f"{job.failures + job.interruptions + 1}\n".encode())
     proc = subprocess.Popen(job.argv, cwd=job.cwd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, start_new_session=True)
@@ -142,7 +142,7 @@ def wrap(cfg: Config, job_id: int) -> int:
             store.progress(job_id, chunk=got[0], chunks=got[1], pct=got[2])
     code = proc.wait()
     stop_labelled_containers(job_id)
-    log.write(f"== gpu-manager: exit {code} {time.strftime('%F %T')}\n".encode())
+    log.write(f"== workstation-manager: exit {code} {time.strftime('%F %T')}\n".encode())
     (d / "result.json").write_text(json.dumps(
         {"exit_code": code, "at": time.time(), "oom": oom and code != 0}))
     return 0

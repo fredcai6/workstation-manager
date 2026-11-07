@@ -51,7 +51,7 @@ services:
         ROCM_VERSION: ${ROCM_VERSION:-7.2.4}
         LLAMA_CPP_REF: ${LLAMA_CPP_REF:-b10327}
     ports:
-      # Behind the broker: gpu-manager owns :8005 and forwards here.
+      # Behind the broker: workstation-manager owns :8005 and forwards here.
       - "127.0.0.1:18005:8005"
     volumes:
       # Weights live on the data drive, read-only to the server. Never baked into

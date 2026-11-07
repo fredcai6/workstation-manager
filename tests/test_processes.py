@@ -1,8 +1,8 @@
 
 import os, sys, tempfile, unittest
 
-from gpu_manager.collector import collect, _pci_id_for_entry, _is_amd, _vram_free
-from gpu_manager.snapshot import ProcessInfo
+from workstation_manager.collector import collect, _pci_id_for_entry, _is_amd, _vram_free
+from workstation_manager.snapshot import ProcessInfo
 
 
 def _write(path, content):
@@ -98,7 +98,7 @@ class TestProcessAttribution(unittest.TestCase):
                     raise PermissionError("fixture denied")
                 return real_listdir(path)
 
-            with patch("gpu_manager.collector.os.listdir", side_effect=denied):
+            with patch("workstation_manager.collector.os.listdir", side_effect=denied):
                 r = run(drm, proc)
             self.assertEqual(len(r.devices[0].processes), 0)
             self.assertTrue(any("permission denied" in n for n in r.devices[0].notes), r.devices[0].notes)
@@ -178,7 +178,7 @@ class TestProcessAttribution(unittest.TestCase):
                     return base
                 return base + 10.0   # way past any deadline
 
-            with patch("gpu_manager.collector.time") as mock_time:
+            with patch("workstation_manager.collector.time") as mock_time:
                 mock_time.monotonic = fake_clock
                 r = collect(drm_root=drm, proc_root=proc, budget_seconds=0.001)
 
@@ -223,7 +223,7 @@ class TestTwoDeviceBudgetExhaustion(unittest.TestCase):
                     return base
                 return base + 10.0  # past deadline
 
-            with patch("gpu_manager.collector.time") as mock_time:
+            with patch("workstation_manager.collector.time") as mock_time:
                 mock_time.monotonic = fake_clock
                 r = collect(drm_root=drm, proc_root=proc, budget_seconds=0.001)
 

@@ -3,10 +3,10 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gpu-manager"
+name = "workstation-manager"
 version = "0.1.0"
 description = "GPU manager for one AMD card: batch queue, interactive LLM tier, status page; stdlib only"
 requires-python = ">=3.11"
 
 [project.scripts]
-gpu = "gpu_manager.cli:main"
+ws = "workstation_manager.cli:main"

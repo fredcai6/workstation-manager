@@ -4,7 +4,7 @@ Pure: no I/O, so every rule is testable. The daemon gathers a View, applies the
 returned actions, and asks again next tick.
 
 Rules, in order:
-1. `gpu take` stops everything and starts nothing.
+1. `ws take` stops everything and starts nothing.
 2. With preemption on, a waiting interactive request stops batch, newest first,
    until the interactive pair fits, then starts it.
 3. Queued jobs start first-come first-served when they fit in both the measured

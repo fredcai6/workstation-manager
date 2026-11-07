@@ -1,11 +1,11 @@
-"""Tests for gpu_manager.renderer — no sysfs, hand-built snapshots."""
+"""Tests for workstation_manager.renderer — no sysfs, hand-built snapshots."""
 import json
 import sys
 import unittest
 
 
-from gpu_manager.snapshot import CollectionResult, DeviceSnapshot, ProcessInfo
-from gpu_manager.renderer import render_text, render_json
+from workstation_manager.snapshot import CollectionResult, DeviceSnapshot, ProcessInfo
+from workstation_manager.renderer import render_text, render_json
 
 
 def _dev(pci="0000:03:00.0", vram_total=8*1024**3, vram_used=1*1024**3,
@@ -129,7 +129,7 @@ class TestCLIBudgetValidation(unittest.TestCase):
     """CLI must reject non-finite / non-positive budget values."""
 
     def _cli(self, args):
-        from gpu_manager.cli import main
+        from workstation_manager.cli import main
         return main(args)
 
     def test_budget_inf_rejected(self):

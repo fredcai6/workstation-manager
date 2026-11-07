@@ -14,7 +14,7 @@ from .collector import collect
 from .config import Config
 from .store import ACTIVE, Store
 
-log = logging.getLogger("gpu-manager")
+log = logging.getLogger("workstation-manager")
 
 
 def pick_card(devices, pci_id):
