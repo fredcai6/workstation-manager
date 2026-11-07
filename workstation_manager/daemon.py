@@ -364,6 +364,10 @@ class Daemon:
         for svc in self.cfg.services.values():
             proxy.serve(self.gate, self.cfg.listen, svc.port, svc.backend)
         self.listen_for_wakes()
+        # One reading of the cores before the first decision, so a restart on a busy
+        # machine does not see idle cores.
+        self.meter.sample()
+        time.sleep(1.5)
         self.store.event(None, "broker started")
         while True:
             try:
