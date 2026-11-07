@@ -126,14 +126,16 @@ def _cores(s: Dict[str, Any]) -> str:
         return '<div class="n">cores not reported yet</div>'
     busy = ((s["broker"] or {}).get("cpu") or {}).get("busy") or [0.0] * len(holders)
     colours = _holder_colours(s)
+    cores = ((s["broker"] or {}).get("cpu") or {}).get("cores") or [[i] for i in range(len(holders))]
     cells, legend = [], {}
     for i, h in enumerate(holders):
+        where = "CPUs " + ",".join(map(str, cores[i]))
         if h:
             c = colours.get(h, "var(--other)")
             legend[h] = c
-            cells.append(f'<span style="background:{c}" title="core {i}: {_e(h)}"></span>')
+            cells.append(f'<span style="background:{c}" title="{where}: {_e(h)}"></span>')
         else:
-            cells.append(f'<span title="core {i}: unmanaged, {100 * busy[i]:.0f}% busy">'
+            cells.append(f'<span title="{where}: unmanaged, {100 * busy[i]:.0f}% busy">'
                          f'<b style="height:{100 * busy[i]:.0f}%"></b></span>')
     leg = "".join(f'<span><i style="background:{c}"></i>{_e(n)}</span>' for n, c in legend.items())
     leg += '<span><i style="background:var(--ink3)"></i>unmanaged load</span>'
