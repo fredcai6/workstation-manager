@@ -184,7 +184,7 @@ def make_handler(gate: Gate, backend: int, resolve: Callable[[Optional[str]], Op
         def _handle(self):
             body = self._body()
             if self.path.rstrip("/") == "/health" and not (gate.ok.get(backend) and not gate.closed):
-                return self._plain(503, "gpu-manager: interactive pair is down; requests queue\n")
+                return self._plain(503, "workstation-manager: interactive pair is down; requests queue\n")
             outcome = gate.admit(backend, holds_pair(self.headers),
                                  gone=lambda: client_gone(self.connection),
                                  model=resolve(requested_model(body, self.path)))
@@ -192,7 +192,7 @@ def make_handler(gate: Gate, backend: int, resolve: Callable[[Optional[str]], Op
                 self.close_connection = True
                 return
             if outcome == TIMED_OUT:
-                return self._plain(503, "gpu-manager: timed out waiting for the GPU\n")
+                return self._plain(503, "workstation-manager: timed out waiting for the GPU\n")
             try:
                 conn = http.client.HTTPConnection("127.0.0.1", backend, timeout=None)
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
@@ -218,7 +218,7 @@ def make_handler(gate: Gate, backend: int, resolve: Callable[[Optional[str]], Op
                 conn.close()
             except (ConnectionError, http.client.HTTPException, OSError):
                 try:
-                    self._plain(502, "gpu-manager: backend went away mid-request\n")
+                    self._plain(502, "workstation-manager: backend went away mid-request\n")
                 except OSError:
                     pass
             finally:

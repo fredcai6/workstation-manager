@@ -1,7 +1,7 @@
-# Copy to ~/.config/gpu-manager/config.toml. Every key is optional; defaults are in
-# gpu_manager/config.py.
+# Copy to ~/.config/workstation-manager/config.toml. Every key is optional; defaults are in
+# workstation_manager/config.py.
 
-# The compute card's PCI address (`gpu status` lists them). Unset: the AMD card with
+# The compute card's PCI address (`ws status` lists them). Unset: the AMD card with
 # the most VRAM.
 # pci_id = "0000:03:00.0"
 
@@ -14,7 +14,7 @@
 # listen = ["127.0.0.1", "172.17.0.1", "172.18.0.1"]
 
 # Where the status page is written. Add a static site's directory to read it remotely.
-# page_dirs = ["~/.local/state/gpu-manager/page", "/srv/site/gpu-status"]
+# page_dirs = ["~/.local/state/workstation-manager/page", "/srv/site/gpu-status"]
 
 # Batch may take the card after this long without an assistant request (X-GPU-Hold: 1).
 # hold_minutes = 30
@@ -33,11 +33,11 @@
 # default_model = "small"
 #
 # [models.small]
-# env_file = "~/.config/gpu-manager/small.env"
+# env_file = "~/.config/workstation-manager/small.env"
 # vram_mib = 12500
 #
 # [models.big]
-# env_file = "~/.config/gpu-manager/big.env"
+# env_file = "~/.config/workstation-manager/big.env"
 # aliases = ["big-model-file-name"]
 # vram_mib = 27500
 

@@ -15,9 +15,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from gpu_manager import config, daemon, proxy, runner
-from gpu_manager.config import REPO, Config
-from gpu_manager.store import Store
+from workstation_manager import config, daemon, proxy, runner
+from workstation_manager.config import REPO, Config
+from workstation_manager.store import Store
 
 
 class Tmp(unittest.TestCase):
@@ -95,8 +95,8 @@ class TestWrap(Tmp):
         jid = self.submit([sys.executable, "-c", self.script, "30"])
         conf = self.dir / "config.toml"
         conf.write_text(f'state_dir = "{self.cfg.state_dir}"\n')
-        env = dict(os.environ, GPU_MANAGER_CONFIG=str(conf))
-        p = subprocess.Popen([sys.executable, str(REPO / "gpu"), "_wrap", str(jid)], env=env)
+        env = dict(os.environ, WORKSTATION_MANAGER_CONFIG=str(conf))
+        p = subprocess.Popen([sys.executable, str(REPO / "ws"), "_wrap", str(jid)], env=env)
         deadline = time.time() + 10
         while self.store.get(jid).chunks is None and time.time() < deadline:
             time.sleep(0.1)
@@ -310,7 +310,7 @@ class TestWantedModel(Tmp):
 class TestObservePair(Tmp):
     def test_pair_state_opens_the_backend_ports_the_proxy_checks(self):
         d = daemon.Daemon(self.cfg, store=self.store)
-        with mock.patch("gpu_manager.interactive.state", return_value="up"):
+        with mock.patch("workstation_manager.interactive.state", return_value="up"):
             d.observe_pair()
         self.assertTrue(d.gate.ok[self.cfg.llm_backend])
         self.assertTrue(d.gate.ok[self.cfg.asr_backend])

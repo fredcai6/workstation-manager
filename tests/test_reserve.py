@@ -1,7 +1,7 @@
 import time
 import unittest
 
-from gpu_manager.config import Config
+from workstation_manager.config import Config
 
 
 def at(hh, mm):

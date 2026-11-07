@@ -1,4 +1,4 @@
-"""Broker state as one dict (for `gpu status --json` and the status page) and as text."""
+"""Broker state as one dict (for `ws status --json` and the status page) and as text."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def render_text(s: Dict[str, Any]) -> str:
     stale = b["age_seconds"] > 60
     out.append(f"  {'STALE' if stale else 'running'} (last tick {_ago(b['age_seconds'])} ago)")
     if s["take"]:
-        out.append("  TAKEN by operator: nothing starts until `gpu release`")
+        out.append("  TAKEN by operator: nothing starts until `ws release`")
     pair = b["pair"]
     line = f"  Interactive pair: {pair}"
     if b.get("model"):

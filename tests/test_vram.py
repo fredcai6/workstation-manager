@@ -1,8 +1,8 @@
 
 import os, sys, tempfile, unittest
 
-from gpu_manager.collector import collect, _pci_id_for_entry, _is_amd, _vram_free
-from gpu_manager.snapshot import ProcessInfo
+from workstation_manager.collector import collect, _pci_id_for_entry, _is_amd, _vram_free
+from workstation_manager.snapshot import ProcessInfo
 
 
 def _write(path, content):

@@ -1,7 +1,7 @@
 import unittest
 
-from gpu_manager.scheduler import Svc, View, decide
-from gpu_manager.store import Job
+from workstation_manager.scheduler import Svc, View, decide
+from workstation_manager.store import Job
 
 TOTAL = 32624
 PAIR = 30000
