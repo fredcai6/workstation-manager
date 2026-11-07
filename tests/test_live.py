@@ -40,6 +40,8 @@ class TestLive(unittest.TestCase):
         for p in self.patches:
             p.start()
         self.d = daemon.Daemon(self.cfg)
+        # The machine's real load is not this test's business: every core reads idle.
+        self.d.meter.sample = lambda now=None: [0.0] * len(self.d.cores)
         self.stop = threading.Event()
         self.ticker = threading.Thread(target=self.tick_loop, daemon=True)
         self.ticker.start()
