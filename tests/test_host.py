@@ -190,6 +190,13 @@ class TestStore(unittest.TestCase):
             db.close()
             j = Store(path).get(1)
             self.assertEqual((j.cores, j.mem_mib, j.cpus), (1, 0, None))
+            # submitted under the old names, it keeps them
+            self.assertEqual((j.legacy, j.unit), (True, "gpu-job-1"))
+            from workstation_manager import runner
+            self.assertEqual(runner.label(j), "gpu-manager.job=1")
+            new = Store(path).get(Store(path).submit("n", None, 0, ["x"], "/", 2, 60, mem_mib=1024))
+            self.assertEqual((new.legacy, new.unit, runner.label(new)),
+                             (False, "ws-job-2", "workstation-manager.job=2"))
 
     def test_lease_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
@@ -203,3 +210,22 @@ class TestStore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLegacyCommand(unittest.TestCase):
+    def test_ws_submit_needs_mem_and_the_gpu_shim_does_not(self):
+        import os, subprocess, sys
+        from workstation_manager.config import REPO
+        with tempfile.TemporaryDirectory() as d:
+            conf = Path(d) / "config.toml"
+            conf.write_text(f'state_dir = "{d}/state"\n')
+            env = dict(os.environ, WORKSTATION_MANAGER_CONFIG=str(conf))
+            r = subprocess.run([sys.executable, str(REPO / "ws"), "submit", "--", "true"],
+                               env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("--mem is required", r.stderr)
+            r = subprocess.run([sys.executable, str(REPO / "gpu"), "submit", "--vram", "1G", "--", "true"],
+                               env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            j = Store(Path(d) / "state/broker.db").get(1)
+            self.assertEqual((j.legacy, j.mem_mib, j.vram_mib), (True, 0, 1024))

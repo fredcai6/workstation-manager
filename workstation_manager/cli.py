@@ -93,7 +93,11 @@ def cmd_submit(args, cfg) -> int:
     argv = _command(args, "submit")
     if not argv:
         return 2
-    if _never_fits(cfg, args.cores, args.mem, "submit"):
+    legacy = args.mem is None
+    if legacy and not getattr(args, "legacy_ok", False):
+        print("ws submit: --mem is required (peak memory, e.g. 8G)", file=sys.stderr)
+        return 2
+    if _never_fits(cfg, args.cores, args.mem or 0, "submit"):
         return 2
     if args.vram:
         from .daemon import pick_card
@@ -111,11 +115,11 @@ def cmd_submit(args, cfg) -> int:
     job_id = store.submit(name, owner, args.vram, argv, os.getcwd(),
                           cfg.default_retries if args.retries is None else args.retries,
                           cfg.default_grace_seconds if args.grace is None else args.grace,
-                          cores=args.cores, mem_mib=args.mem)
+                          cores=args.cores, mem_mib=args.mem or 0, legacy=legacy)
     runner.save_env(cfg, job_id, dict(os.environ))
     from .lease import poke
     poke(cfg)
-    print(f"submitted job #{job_id} ({name}, {describe(args.cores, args.mem, args.vram)}); "
+    print(f"submitted job #{job_id} ({name}, {describe(args.cores, args.mem or 0, args.vram)}); "
           f"log: {cfg.job_dir(job_id) / 'log'}")
     return 0
 
@@ -166,7 +170,7 @@ def cmd_cancel(args, cfg) -> int:
 
 
 def cmd_progress(args, cfg) -> int:
-    job_id = args.job or os.environ.get("WS_JOB_ID")
+    job_id = args.job or os.environ.get("WS_JOB_ID") or os.environ.get("GPU_JOB_ID")
     if not job_id:
         print("ws progress: not inside a job (no $WS_JOB_ID); pass --job", file=sys.stderr)
         return 2
@@ -215,7 +219,14 @@ def cmd_wrap(args, cfg) -> int:
     return runner.wrap(cfg, args.id)
 
 
-def main(argv=None) -> int:
+def legacy_main(argv=None) -> int:
+    """The `gpu` command: gpu-manager's calls for callers not yet moved to `ws`. A job
+    submitted this way declares no memory and keeps the old names (see Job.legacy)."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    return main(argv, legacy_ok=bool(argv) and argv[0] == "submit")
+
+
+def main(argv=None, legacy_ok=False) -> int:
     parser = argparse.ArgumentParser(prog="ws", description="Workstation manager: queue and leases for the cores, memory and GPU, and the interactive tier.")
     sub = parser.add_subparsers(dest="command")
 
@@ -231,8 +242,8 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("submit", help="Queue a batch job.")
     p.add_argument("--cores", type=int, default=1, help="Physical cores (default 1).")
-    p.add_argument("--mem", type=parse_size, required=True,
-                   help="Peak memory, e.g. 8G; the job is killed past it.")
+    p.add_argument("--mem", type=parse_size,
+                   help="Peak memory, e.g. 8G (required); the job is killed past it.")
     p.add_argument("--vram", type=parse_size, default=0, help="Peak VRAM, e.g. 18G (default none).")
     p.add_argument("--name")
     p.add_argument("--owner", help="Who submitted it (default $WS_OWNER or user).")
@@ -272,6 +283,7 @@ def main(argv=None) -> int:
     p.set_defaults(fn=cmd_wrap)
 
     args = parser.parse_args(argv)
+    args.legacy_ok = legacy_ok
     if not getattr(args, "fn", None):
         parser.print_help()
         return 1

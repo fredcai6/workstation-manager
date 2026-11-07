@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     note TEXT,
     cores INTEGER NOT NULL DEFAULT 1,
     mem_mib INTEGER NOT NULL DEFAULT 0,
-    cpus TEXT
+    cpus TEXT,
+    legacy INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS leases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +63,7 @@ CREATE TABLE IF NOT EXISTS events (
 ACTIVE = ("running", "stopping")
 # Columns added after the first schema, with their definitions, for older databases.
 JOB_COLUMNS = {"cores": "INTEGER NOT NULL DEFAULT 1", "mem_mib": "INTEGER NOT NULL DEFAULT 0",
-               "cpus": "TEXT"}
+               "cpus": "TEXT", "legacy": "INTEGER NOT NULL DEFAULT 0"}
 
 
 @dataclasses.dataclass
@@ -91,10 +92,14 @@ class Job:
     cores: int = 1                  # physical cores
     mem_mib: int = 0                # peak memory, enforced as the unit's MemoryMax
     cpus: Optional[List[int]] = None  # logical CPUs it was given when started
+    # Submitted under the gpu-manager names (before the rename, or through the `gpu`
+    # shim): keeps the gpu-job-N unit, the old container label and GPU_JOB_* env, and
+    # is neither pinned nor memory-capped. Goes away with the shim.
+    legacy: bool = False
 
     @property
     def unit(self) -> str:
-        return f"ws-job-{self.id}"
+        return f"{'gpu' if self.legacy else 'ws'}-job-{self.id}"
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -138,16 +143,18 @@ class Store:
         for col, ddl in JOB_COLUMNS.items():
             if col not in have:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+                if col == "legacy":  # every job so far was submitted under the old names
+                    self.db.execute("UPDATE jobs SET legacy=1")
 
     # -- jobs -------------------------------------------------------------
     def submit(self, name, owner, vram_mib, argv, cwd, retries, grace_seconds,
-               now=None, cores=1, mem_mib=0) -> int:
+               now=None, cores=1, mem_mib=0, legacy=False) -> int:
         now = time.time() if now is None else now
         cur = self.db.execute(
             "INSERT INTO jobs (name, owner, vram_mib, argv, cwd, retries, grace_seconds,"
-            " status, submitted_at, cores, mem_mib) VALUES (?,?,?,?,?,?,?, 'queued', ?,?,?)",
+            " status, submitted_at, cores, mem_mib, legacy) VALUES (?,?,?,?,?,?,?, 'queued', ?,?,?,?)",
             (name, owner, vram_mib, json.dumps(argv), cwd, retries, grace_seconds, now,
-             cores, mem_mib))
+             cores, mem_mib, int(legacy)))
         self.event(cur.lastrowid, f"submitted ({describe(cores, mem_mib, vram_mib)})", now)
         return cur.lastrowid
 
@@ -155,6 +162,7 @@ class Store:
         d = dict(row)
         d["argv"] = json.loads(d["argv"])
         d["cpus"] = json.loads(d["cpus"]) if d.get("cpus") else None
+        d["legacy"] = bool(d.get("legacy"))
         return Job(**d)
 
     def get(self, job_id: int) -> Optional[Job]:

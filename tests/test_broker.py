@@ -80,12 +80,12 @@ class TestWrap(Tmp):
 
     def test_waits_for_container_removal_then_forces_it(self):
         seen = {"n": 0}
-        def fake_labelled(job_id, all_states):
+        def fake_labelled(job_label, all_states):
             seen["n"] += 1
             return ["abc"]  # never goes away on its own
         with mock.patch.object(runner, "_labelled", side_effect=fake_labelled), \
              mock.patch.object(runner.subprocess, "run") as run:
-            runner.stop_labelled_containers(1, wait_seconds=1.5)
+            runner.stop_labelled_containers("workstation-manager.job=1", wait_seconds=1.5)
         cmds = [c.args[0][:3] for c in run.call_args_list]
         self.assertIn(["docker", "stop", "-t"], cmds)
         self.assertIn(["docker", "rm", "-f"], cmds)

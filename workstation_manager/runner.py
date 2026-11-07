@@ -32,8 +32,8 @@ PCT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
 OOM_RE = re.compile(r"RESOURCE_EXHAUSTED|out of memory|hipErrorOutOfMemory|HIP out of memory", re.I)
 
 
-def label(job_id: int) -> str:
-    return f"workstation-manager.job={job_id}"
+def label(job: Job) -> str:
+    return f"{'gpu-manager' if job.legacy else 'workstation-manager'}.job={job.id}"
 
 
 def save_env(cfg: Config, job_id: int, env: dict) -> None:
@@ -58,7 +58,8 @@ def start(cfg: Config, job: Job) -> None:
         # The wrapper reads the same config (and so the same state) as this broker.
         *([f"--setenv=WORKSTATION_MANAGER_CONFIG={os.environ['WORKSTATION_MANAGER_CONFIG']}"]
           if os.environ.get("WORKSTATION_MANAGER_CONFIG") else []),
-        *(["-p", f"MemoryMax={job.mem_mib}M", "-p", "MemorySwapMax=0"] if job.mem_mib else []),
+        *(["-p", f"MemoryMax={job.mem_mib}M", "-p", "MemorySwapMax=0"]
+          if job.mem_mib and not job.legacy else []),
         sys.executable, str(REPO / "ws"), "_wrap", str(job.id),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -75,20 +76,20 @@ def is_active(job: Job) -> bool:
     return r.stdout.strip() in ("active", "activating", "deactivating", "reloading")
 
 
-def _labelled(job_id: int, all_states: bool) -> list:
+def _labelled(job_label: str, all_states: bool) -> list:
     r = subprocess.run(["docker", "ps", "-q", *(["-a"] if all_states else []),
-                        "--filter", f"label={label(job_id)}"], capture_output=True, text=True)
+                        "--filter", f"label={job_label}"], capture_output=True, text=True)
     return r.stdout.split()
 
 
-def stop_labelled_containers(job_id: int, wait_seconds: float = 60) -> None:
+def stop_labelled_containers(job_label: str, wait_seconds: float = 60) -> None:
     """Stop the job's containers and wait until they are gone, so a rerun of the same
     command cannot collide with a `--rm` container that is still being removed."""
-    ids = _labelled(job_id, all_states=False)
+    ids = _labelled(job_label, all_states=False)
     if ids:
         subprocess.run(["docker", "stop", "-t", "20", *ids], capture_output=True)
     deadline = time.time() + wait_seconds
-    while (ids := _labelled(job_id, all_states=True)) and time.time() < deadline:
+    while (ids := _labelled(job_label, all_states=True)) and time.time() < deadline:
         time.sleep(1)
     if ids:
         subprocess.run(["docker", "rm", "-f", *ids], capture_output=True)
@@ -110,10 +111,13 @@ def wrap(cfg: Config, job_id: int) -> int:
     job = store.get(job_id)
     d = cfg.job_dir(job_id)
     env = json.loads((d / "env.json").read_text())
-    env.update(WS_JOB_ID=str(job_id), WS_JOB_LABEL=label(job_id),
+    env.update(WS_JOB_ID=str(job_id), WS_JOB_LABEL=label(job),
                WS_JOB_VRAM_MIB=str(job.vram_mib), WS_JOB_MEM_MIB=str(job.mem_mib),
                PYTHONUNBUFFERED="1")
-    if job.cpus:
+    if job.legacy:
+        env.update(GPU_JOB_ID=str(job_id), GPU_JOB_LABEL=label(job),
+                   GPU_JOB_VRAM_MIB=str(job.vram_mib))
+    elif job.cpus:
         cpu.pin_process(job.cpus)
         env = cpu.thread_env(env, job.cores, job.cpus)
     oom_kills_before = cpu.own_oom_kills()
@@ -155,7 +159,7 @@ def wrap(cfg: Config, job_id: int) -> int:
         if got:
             store.progress(job_id, chunk=got[0], chunks=got[1], pct=got[2])
     code = proc.wait()
-    stop_labelled_containers(job_id)
+    stop_labelled_containers(label(job))
     mem_oom = code != 0 and cpu.own_oom_kills() > oom_kills_before
     if mem_oom:
         log.write(f"== workstation-manager: killed at its memory limit ({job.mem_mib} MiB)\n".encode())
