@@ -124,7 +124,9 @@ class Lease:
     cpus: Optional[List[int]]
 
 
-def describe(cores: int, mem_mib: int, vram_mib: int) -> str:
+def describe(cores: int, mem_mib: int, vram_mib: int, legacy: bool = False) -> str:
+    if legacy:
+        return f"{vram_mib / 1024:.1f} GB VRAM; cores and memory undeclared"
     bits = [f"{cores} core{'s' if cores != 1 else ''}", f"{mem_mib / 1024:.1f} GB"]
     if vram_mib:
         bits.append(f"{vram_mib / 1024:.1f} GB VRAM")
