@@ -32,6 +32,10 @@ Rules, in order:
    declare VRAM; a CPU-only job neither waits for the pair nor sends it away.
 10. A lease (a foreground pytest or `ws run`: a caller is waiting) is granted ahead
    of queued batch, first come first served, even during a take: it holds no VRAM.
+11. Priority: the queue is in priority order (highest first, then first come). When
+   the first job waiting for the card cannot fit, running jobs of lower priority are
+   stopped and requeued, newest first, until it would, if stopping them is enough.
+   Jobs that are already stopping count as gone. Not during a reserve window.
 """
 
 from __future__ import annotations
@@ -269,6 +273,8 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
 
     # Only jobs that need the card keep the pair away or send it off.
     waiting = [j for j in waiting if j.vram_mib > 0]
+    if waiting and not v.reserved:
+        actions += _make_room(v, waiting[0], cap - committed - pair_mib)
     if v.reserved:
         if v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
             actions.append(("start_pair", want))
@@ -280,4 +286,22 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
             actions.append(("stop_pair",))
     elif v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
         actions.append(("start_pair", want))
+    return actions
+
+
+def _make_room(v: View, first: Job, room_mib: int) -> List[Action]:
+    """Stop lower-priority running jobs, newest first, so `first` fits on the card."""
+    room_mib += sum(j.vram_mib for j in v.active if j.status == "stopping")
+    if first.vram_mib <= room_mib:
+        return []
+    below = [j for j in v.active if j.status == "running" and j.vram_mib
+             and j.priority < first.priority]
+    if first.vram_mib > room_mib + sum(j.vram_mib for j in below):
+        return []  # stopping them would not be enough
+    actions: List[Action] = []
+    for j in sorted(below, key=lambda j: j.started_at or 0, reverse=True):
+        if first.vram_mib <= room_mib:
+            break
+        actions.append(("stop_job", j.id, "requeue"))
+        room_mib += j.vram_mib
     return actions

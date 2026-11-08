@@ -154,6 +154,8 @@ def render_text(s: Dict[str, Any]) -> str:
     out.append("  Queue:" if s["queued"] else "  Queue: empty")
     for j in s["queued"]:
         extra = f", {j['interruptions']} interruption(s)" if j["interruptions"] else ""
+        if j.get("priority"):
+            extra += f", priority {j['priority']}"
         out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  waiting "
                    f"{_ago(now - j['submitted_at'])}{extra}"
                    + (f"  ({j['owner']})" if j["owner"] else ""))
