@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     cores INTEGER NOT NULL DEFAULT 1,
     mem_mib INTEGER NOT NULL DEFAULT 0,
     cpus TEXT,
-    legacy INTEGER NOT NULL DEFAULT 0
+    legacy INTEGER NOT NULL DEFAULT 0,
+    priority INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS leases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +64,8 @@ CREATE TABLE IF NOT EXISTS events (
 ACTIVE = ("running", "stopping")
 # Columns added after the first schema, with their definitions, for older databases.
 JOB_COLUMNS = {"cores": "INTEGER NOT NULL DEFAULT 1", "mem_mib": "INTEGER NOT NULL DEFAULT 0",
-               "cpus": "TEXT", "legacy": "INTEGER NOT NULL DEFAULT 0"}
+               "cpus": "TEXT", "legacy": "INTEGER NOT NULL DEFAULT 0",
+               "priority": "INTEGER NOT NULL DEFAULT 0"}
 
 
 @dataclasses.dataclass
@@ -96,6 +98,8 @@ class Job:
     # shim): keeps the gpu-job-N unit, the old container label and GPU_JOB_* env, and
     # is neither pinned nor memory-capped. Goes away with the shim.
     legacy: bool = False
+    # Higher goes first in the queue, and stops running jobs below it that keep it off the card.
+    priority: int = 0
 
     @property
     def unit(self) -> str:
@@ -150,13 +154,14 @@ class Store:
 
     # -- jobs -------------------------------------------------------------
     def submit(self, name, owner, vram_mib, argv, cwd, retries, grace_seconds,
-               now=None, cores=1, mem_mib=0, legacy=False) -> int:
+               now=None, cores=1, mem_mib=0, legacy=False, priority=0) -> int:
         now = time.time() if now is None else now
         cur = self.db.execute(
             "INSERT INTO jobs (name, owner, vram_mib, argv, cwd, retries, grace_seconds,"
-            " status, submitted_at, cores, mem_mib, legacy) VALUES (?,?,?,?,?,?,?, 'queued', ?,?,?,?)",
+            " status, submitted_at, cores, mem_mib, legacy, priority)"
+            " VALUES (?,?,?,?,?,?,?, 'queued', ?,?,?,?,?)",
             (name, owner, vram_mib, json.dumps(argv), cwd, retries, grace_seconds, now,
-             cores, mem_mib, int(legacy)))
+             cores, mem_mib, int(legacy), priority))
         self.event(cur.lastrowid, f"submitted ({describe(cores, mem_mib, vram_mib)})", now)
         return cur.lastrowid
 
@@ -173,11 +178,11 @@ class Store:
 
     def jobs(self, statuses=None) -> List[Job]:
         if statuses:
-            q = "SELECT * FROM jobs WHERE status IN (%s) ORDER BY submitted_at, id" % (
+            q = "SELECT * FROM jobs WHERE status IN (%s) ORDER BY priority DESC, submitted_at, id" % (
                 ",".join("?" * len(statuses)))
             rows = self.db.execute(q, tuple(statuses)).fetchall()
         else:
-            rows = self.db.execute("SELECT * FROM jobs ORDER BY submitted_at, id").fetchall()
+            rows = self.db.execute("SELECT * FROM jobs ORDER BY priority DESC, submitted_at, id").fetchall()
         return [self._job(r) for r in rows]
 
     def recent(self, limit=10) -> List[Job]:

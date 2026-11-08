@@ -8,8 +8,8 @@ PAIR = 30000
 MARGIN = 1024
 
 
-def job(id, vram, status="queued", submitted=0.0, started=None):
-    return Job(id=id, name=f"j{id}", owner=None, vram_mib=vram, argv=["x"], cwd="/",
+def job(id, vram, status="queued", submitted=0.0, started=None, priority=0):
+    return Job(priority=priority, id=id, name=f"j{id}", owner=None, vram_mib=vram, argv=["x"], cwd="/",
                retries=2, grace_seconds=60, status=status, submitted_at=submitted,
                started_at=started, ended_at=None, failures=0, interruptions=0,
                exit_code=None, stop_request=None, chunk=None, chunks=None, pct=None,
@@ -199,3 +199,38 @@ class TestScheduler(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPriority(unittest.TestCase):
+    def test_priority_job_stops_lower_running_job_for_the_card(self):
+        low = job(1, 18000, status="running", started=1.0)
+        hot = job(2, 30000, priority=10)
+        self.assertEqual(run(view(queued=[hot], active=[low], pair="down")),
+                         [("stop_job", 1, "requeue")])
+
+    def test_stops_newest_first_and_only_as_many_as_needed(self):
+        a = job(1, 10000, status="running", started=1.0)
+        b = job(2, 10000, status="running", started=2.0)
+        hot = job(3, 18000, priority=10)
+        self.assertEqual(run(view(queued=[hot], active=[a, b], pair="down")),
+                         [("stop_job", 2, "requeue")])
+
+    def test_stopping_jobs_count_as_gone(self):
+        low = job(1, 18000, status="stopping", started=1.0)
+        hot = job(2, 30000, priority=10)
+        self.assertEqual(run(view(queued=[hot], active=[low], pair="down")), [])
+
+    def test_equal_priority_is_not_stopped(self):
+        low = job(1, 18000, status="running", started=1.0)
+        self.assertEqual(run(view(queued=[job(2, 30000)], active=[low], pair="down")), [])
+
+    def test_higher_running_job_is_left_alone(self):
+        top = job(1, 18000, status="running", started=1.0, priority=20)
+        hot = job(2, 30000, priority=10)
+        self.assertEqual(run(view(queued=[hot], active=[top], pair="down")), [])
+
+    def test_not_in_a_reserve_window(self):
+        low = job(1, 18000, status="running", started=1.0)
+        hot = job(2, 30000, priority=10)
+        acts = run(view(queued=[hot], active=[low], pair="down", reserved=True))
+        self.assertNotIn(("stop_job", 1, "requeue"), acts)

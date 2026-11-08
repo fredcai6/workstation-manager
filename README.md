@@ -107,7 +107,11 @@ events. The broker rewrites it every 30 s into each directory in `page_dirs`.
   (MemTotal less `mem_margin_mib`, 8 GB) and what is measured: MemAvailable less the
   margin, less memory running holders have declared but not yet used.
 - **Order.** Leases go first, first come first served, even during a take: they hold
-  no VRAM. Then jobs, first come first served. A later job may start ahead of the
+  no VRAM. Then jobs, highest `--priority` first (default 0; `ws priority ID N`
+  changes it), then first come first served. When the first job waiting for the card
+  cannot fit, running jobs of lower priority are stopped and requeued, newest first,
+  until it would (never in a reserve window), so give priority only to work that
+  should interrupt others, and only to jobs that resume. A later job may start ahead of the
   head only if the head would still fit once running work is gone, in every
   resource the later job uses. A CPU-only job neither waits for the pair nor sends
   it away.

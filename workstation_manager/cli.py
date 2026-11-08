@@ -5,6 +5,7 @@
   ws run [--cores 4] --mem 8G [--name N] -- CMD...   in the foreground, once it fits
   ws queue                                 broker state only
   ws cancel ID
+  ws priority ID N
   ws progress --chunk 2/4 [--pct 50]       from inside a job (uses $WS_JOB_ID)
   ws log ID                                path of a job's log
   ws take / ws release                     operator override
@@ -115,7 +116,8 @@ def cmd_submit(args, cfg) -> int:
     job_id = store.submit(name, owner, args.vram, argv, os.getcwd(),
                           cfg.default_retries if args.retries is None else args.retries,
                           cfg.default_grace_seconds if args.grace is None else args.grace,
-                          cores=args.cores, mem_mib=args.mem or 0, legacy=legacy)
+                          cores=args.cores, mem_mib=args.mem or 0, legacy=legacy,
+                          priority=args.priority)
     runner.save_env(cfg, job_id, dict(os.environ))
     from .lease import poke
     poke(cfg)
@@ -166,6 +168,20 @@ def cmd_cancel(args, cfg) -> int:
         return 1
     store.update(job.id, stop_request="cancel")
     print(f"cancelling job #{job.id} ({job.status})")
+    return 0
+
+
+def cmd_priority(args, cfg) -> int:
+    store = _store(cfg)
+    job = store.get(args.id)
+    if job is None or job.status in ("done", "failed", "cancelled"):
+        print(f"ws priority: no live job #{args.id}", file=sys.stderr)
+        return 1
+    store.update(job.id, priority=args.priority)
+    store.event(job.id, f"priority {job.priority} -> {args.priority}")
+    from .lease import poke
+    poke(cfg)
+    print(f"job #{job.id} ({job.name}, {job.status}) now has priority {args.priority}")
     return 0
 
 
@@ -249,6 +265,8 @@ def main(argv=None, legacy_ok=False) -> int:
     p.add_argument("--owner", help="Who submitted it (default $WS_OWNER or user).")
     p.add_argument("--retries", type=int, help="Retries after a failing exit (default 2).")
     p.add_argument("--grace", type=int, help="Seconds between SIGTERM and SIGKILL (default 60).")
+    p.add_argument("--priority", type=int, default=0,
+                   help="Higher goes first and stops lower running jobs for the card (default 0).")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_submit)
 
@@ -263,6 +281,11 @@ def main(argv=None, legacy_ok=False) -> int:
     p = sub.add_parser("cancel", help="Cancel a queued or running job.")
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_cancel)
+
+    p = sub.add_parser("priority", help="Set a queued or running job's priority.")
+    p.add_argument("id", type=int)
+    p.add_argument("priority", type=int)
+    p.set_defaults(fn=cmd_priority)
 
     p = sub.add_parser("progress", help="Report progress from inside a job.")
     p.add_argument("--chunk", help="N/M")

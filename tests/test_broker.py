@@ -318,3 +318,17 @@ class TestObservePair(Tmp):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestQueueOrder(unittest.TestCase):
+    def test_priority_then_first_come(self):
+        import tempfile
+        from pathlib import Path
+        from workstation_manager.store import Store
+        with tempfile.TemporaryDirectory() as d:
+            st = Store(Path(d) / "b.db")
+            a = st.submit("a", None, 0, ["x"], "/", 0, 60, now=1.0, mem_mib=1)
+            b = st.submit("b", None, 0, ["x"], "/", 0, 60, now=2.0, mem_mib=1, priority=10)
+            c = st.submit("c", None, 0, ["x"], "/", 0, 60, now=3.0, mem_mib=1)
+            st.update(c, priority=10)
+            self.assertEqual([j.id for j in st.jobs(("queued",))], [b, c, a])
