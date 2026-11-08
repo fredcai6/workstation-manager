@@ -255,10 +255,12 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     for job in v.queued:
         if job.vram_mib > min(room, free) or not host.fits(job):
             continue
-        if job is not head and head in waiting:
-            if job.vram_mib and cap - (committed + job.vram_mib) < head.vram_mib:
+        # Whoever is first still waiting is protected, also once the original head starts.
+        first = waiting[0]
+        if job is not first:
+            if job.vram_mib and cap - (committed + job.vram_mib) < first.vram_mib:
                 continue
-            if not host.leaves_room_for(job, head):
+            if not host.leaves_room_for(job, first):
                 continue
         if job.vram_mib and swap_blocked and cap - (committed + job.vram_mib) < want_mib:
             continue

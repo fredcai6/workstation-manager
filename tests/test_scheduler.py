@@ -234,3 +234,9 @@ class TestPriority(unittest.TestCase):
         hot = job(2, 30000, priority=10)
         acts = run(view(queued=[hot], active=[low], pair="down", reserved=True))
         self.assertNotIn(("stop_job", 1, "requeue"), acts)
+
+    def test_next_waiting_job_is_protected_once_the_head_starts(self):
+        a, b, c = job(1, 17000, priority=10), job(2, 30000, priority=10), job(3, 13000)
+        acts = run(view(queued=[a, b, c], pair="down"))
+        self.assertIn(("start_job", 1), acts)
+        self.assertNotIn(("start_job", 3), acts)
