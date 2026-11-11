@@ -71,7 +71,16 @@ def host_summary(s: Dict[str, Any]) -> Dict[str, Any]:
     holders = core_holders(s)
     busy = cpu.get("busy") or []
     granted = [l for l in s.get("leases", ()) if l["status"] == "granted"]
+    declared = sum(j.get("mem_mib") or 0 for j in s["running"]) + sum(l["mem_mib"] for l in granted)
+    room = None
+    if mem.get("total_mib") and mem.get("available_mib") is not None:
+        margin = mem.get("margin_mib") or 0
+        # As the scheduler sees it: the declared budget and what is measured, less
+        # memory holders have declared but not yet used.
+        room = max(0, min(mem["total_mib"] - margin - declared,
+                          mem["available_mib"] - margin - (mem.get("unrealized_mib") or 0)))
     return {
+        "mem_room_mib": room,
         "cores": len(holders),
         "held": sum(1 for h in holders if h),
         "unmanaged_busy": sum(b for b, h in zip(busy, holders) if not h),
@@ -108,6 +117,7 @@ def render_text(s: Dict[str, Any]) -> str:
     if b is None:
         return "\n".join(out + ["  not running (no state yet)"])
     stale = b["age_seconds"] > 60
+    why = b.get("waiting_on") or {}
     out.append(f"  {'STALE' if stale else 'running'} (last tick {_ago(b['age_seconds'])} ago)")
     if s["take"]:
         out.append("  TAKEN by operator: nothing starts until `ws release`")
@@ -134,7 +144,8 @@ def render_text(s: Dict[str, Any]) -> str:
                    f"unmanaged work; {h['reserve']} always left to it")
     if h["mem_total_mib"]:
         out.append(f"  Memory: {h['mem_available_mib'] / 1024:.1f} GB available of "
-                   f"{h['mem_total_mib'] / 1024:.1f}; {h['mem_declared_mib'] / 1024:.1f} GB declared by holders")
+                   f"{h['mem_total_mib'] / 1024:.1f}; {h['mem_declared_mib'] / 1024:.1f} GB declared by holders"
+                   + (f"; room for new work {h['mem_room_mib'] / 1024:.1f} GB" if h.get("mem_room_mib") is not None else ""))
     leases = s.get("leases", ())
     if leases:
         out.append("  Leases (pytest, ws run):")
@@ -143,20 +154,21 @@ def render_text(s: Dict[str, Any]) -> str:
         out.append(f"    lease #{l['id']} {l['name']}  {describe(l['cores'], l['mem_mib'], 0)}  "
                    f"{'held' if l['status'] == 'granted' else 'waiting'} {_ago(now - when)}"
                    + (f"  cpus {','.join(map(str, l['cpus']))}" if l.get("cpus") else "")
-                   + (f"  ({l['owner']})" if l["owner"] else ""))
+                   + (f"  [{why[f'lease:{l['id']}']}]" if l["status"] != "granted"
+                      and f"lease:{l['id']}" in why else ""))
     out.append("  Running:" if s["running"] else "  Running: none")
     for j in s["running"]:
         out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  {j['status']}"
                    f"  {_progress(j)}  started {_ago(now - (j['started_at'] or now))} ago"
-                   + (f"  ({j['owner']})" if j["owner"] else ""))
+                   + (f", priority {j['priority']}" if j.get("priority") else ""))
         if j.get("log_at"):
             out.append(f"      last output {_ago(now - j['log_at'])} ago: {j['log_last'] or ''}")
     out.append("  Queue:" if s["queued"] else "  Queue: empty")
-    for j in s["queued"]:
+    for n, j in enumerate(s["queued"], 1):
         extra = f", {j['interruptions']} interruption(s)" if j["interruptions"] else ""
-        if j.get("priority"):
-            extra += f", priority {j['priority']}"
-        out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  waiting "
-                   f"{_ago(now - j['submitted_at'])}{extra}"
-                   + (f"  ({j['owner']})" if j["owner"] else ""))
+        out.append(f"    {n}. [{j.get('priority') or 0:+d}] #{j['id']} {j['name']}  "
+                   f"{describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  waiting "
+                   f"{_ago(now - j['submitted_at'])}{extra}")
+        if f"job:{j['id']}" in why:
+            out.append(f"       held up by: {why[f'job:{j['id']}']}")
     return "\n".join(out)

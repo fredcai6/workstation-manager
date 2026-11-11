@@ -241,3 +241,36 @@ class TestLegacyCommand(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             j = Store(Path(d) / "state/broker.db").get(1)
             self.assertEqual((j.legacy, j.mem_mib, j.vram_mib), (True, 0, 1024))
+
+
+class TestWhyWaiting(unittest.TestCase):
+    """The reasons decide() gives for what it did not start, for the status page."""
+
+    def why(self, v):
+        out = {}
+        acts = decide(v, MARGIN, 12500, 30, False, out)
+        return acts, out
+
+    def test_each_resource_names_itself(self):
+        _, why = self.why(hview(queued=[cjob(1, mem=16 * GB)], avail=20 * GB))
+        self.assertEqual(why, {"job:1": "memory: needs 16.0 GB, 12.0 GB free"})
+        _, why = self.why(hview(queued=[cjob(1, cores=11)]))
+        self.assertEqual(why, {"job:1": "cores: needs 11, 10 free"})
+        _, why = self.why(hview(queued=[cjob(1, vram=25 * GB)]))
+        self.assertTrue(why["job:1"].startswith("VRAM: needs 25.0 GB"), why)
+        self.assertIn("pair", why["job:1"])
+
+    def test_a_later_job_held_back_for_the_first(self):
+        acts, why = self.why(hview(queued=[cjob(1, cores=9), cjob(2, cores=2)], busy=[0.0] * 12,
+                                   active=[cjob(3, cores=2, status="running", cpus=[0, 12, 6, 18])]))
+        self.assertEqual(acts, [])
+        self.assertEqual(why["job:2"], "held back for #1 (first in line)")
+
+    def test_started_jobs_and_granted_leases_have_no_reason(self):
+        acts, why = self.why(hview(queued=[cjob(1)], leases=[lease(7)]))
+        self.assertEqual(len(acts), 2)
+        self.assertEqual(why, {})
+
+    def test_reasons_change_no_decision(self):
+        v = hview(queued=[cjob(1, mem=16 * GB), cjob(2)], leases=[lease(7, mem=30 * GB)], avail=20 * GB)
+        self.assertEqual(run(v), self.why(v)[0])

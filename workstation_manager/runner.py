@@ -70,6 +70,18 @@ def stop(job: Job) -> None:
                    capture_output=True)
 
 
+def unit_result(job: Job) -> str:
+    """What the journal says ended the unit, e.g. "status=200/CHDIR". The unit itself
+    is collected once it ends, so systemd no longer knows."""
+    r = subprocess.run(["journalctl", "--user", "-u", job.unit, "-n", "20", "--no-pager", "-o", "cat"],
+                       capture_output=True, text=True)
+    for line in reversed(r.stdout.splitlines()):
+        m = re.search(r"code=\w+, status=(\S+)", line)
+        if m:
+            return f"status={m.group(1)}"
+    return "no unit status in the journal"
+
+
 def is_active(job: Job) -> bool:
     r = subprocess.run(["systemctl", "--user", "is-active", job.unit],
                        capture_output=True, text=True)
@@ -154,9 +166,26 @@ def wrap(cfg: Config, job_id: int) -> int:
     containers: set = set()
     done = threading.Event()
 
+    # Their CPU time and memory, last seen while they ran: a job that runs in a container
+    # uses almost nothing in its own unit.
+    c_cpu: dict = {}
+    c_peak: dict = {}
+    c_together = [0]  # most memory the containers held at once (MiB)
+
     def watch_containers():
         while not done.wait(5):
-            containers.update(cpu.container_ids(label(job)))
+            ids = cpu.container_ids(label(job))
+            containers.update(ids)
+            now_mib = 0
+            for cid in ids:
+                cg = cpu.container_cgroup(cid)
+                used, peak = cpu.cgroup_usage(cg)
+                if used is not None:
+                    c_cpu[cid] = used
+                if peak is not None:
+                    c_peak[cid] = max(peak, c_peak.get(cid, 0))
+                now_mib += cpu.memory_current_mib(cg) or 0
+            c_together[0] = max(c_together[0], now_mib)
     threading.Thread(target=watch_containers, daemon=True).start()
 
     signal.signal(signal.SIGTERM, on_term)
@@ -171,6 +200,16 @@ def wrap(cfg: Config, job_id: int) -> int:
             store.progress(job_id, chunk=got[0], chunks=got[1], pct=got[2])
     code = proc.wait()
     done.set()
+    unit_cpu, unit_peak = cpu.cgroup_usage(cpu.own_cgroup())
+    # Containers' peak: what they were seen holding together, or the largest one's own
+    # peak if that is more (summing peaks would overstate containers run one after another).
+    c_mib = max(c_together[0], max(c_peak.values(), default=0)) if c_peak else None
+    usage = {
+        "wall_seconds": round(time.time() - started, 1),
+        "cpu_seconds": round((unit_cpu or 0) + sum(c_cpu.values()), 1) if unit_cpu is not None or c_cpu else None,
+        "peak_mib": (unit_peak or 0) + (c_mib or 0) if unit_peak is not None or c_mib else None,
+        "container_peak_mib": c_mib,
+    }
     stop_labelled_containers(label(job))
     mem_oom = code != 0 and (cpu.own_oom_kills() > oom_kills_before
                              or cpu.kernel_oom_kills(started, containers))
@@ -178,7 +217,8 @@ def wrap(cfg: Config, job_id: int) -> int:
         log.write(f"== workstation-manager: killed at its memory limit ({job.mem_mib} MiB)\n".encode())
     log.write(f"== workstation-manager: exit {code} {time.strftime('%F %T')}\n".encode())
     (d / "result.json").write_text(json.dumps(
-        {"exit_code": code, "at": time.time(), "oom": oom and code != 0, "mem_oom": mem_oom}))
+        {"exit_code": code, "at": time.time(), "oom": oom and code != 0, "mem_oom": mem_oom,
+         "usage": usage}))
     return 0
 
 

@@ -59,6 +59,29 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
     at REAL NOT NULL, job_id INTEGER, what TEXT NOT NULL
 );
+-- One row per run of a job (each attempt) or lease: what it declared and what it used.
+CREATE TABLE IF NOT EXISTS attempts (
+    kind TEXT NOT NULL,             -- job | lease
+    ref INTEGER NOT NULL,           -- job id or lease id
+    name TEXT,
+    started_at REAL, ended_at REAL NOT NULL,
+    outcome TEXT NOT NULL,          -- done | failed | retry | requeued | interrupted | cancelled | ended
+    exit_code INTEGER,
+    cores INTEGER, mem_mib INTEGER, vram_mib INTEGER, priority INTEGER,
+    cpu_seconds REAL,               -- unit plus containers
+    peak_mib INTEGER,               -- unit plus containers
+    container_peak_mib INTEGER
+);
+CREATE INDEX IF NOT EXISTS attempts_ref ON attempts (kind, ref);
+-- The whole box once a minute, and what holds up each waiting job and lease.
+CREATE TABLE IF NOT EXISTS samples (
+    at REAL NOT NULL,
+    cores_held INTEGER, unmanaged_busy REAL,
+    mem_available_mib INTEGER, mem_declared_mib INTEGER, mem_unrealized_mib INTEGER,
+    vram_used_mib INTEGER, gpu_busy_pct INTEGER, pair TEXT, model TEXT,
+    running INTEGER, queued INTEGER, leases_held INTEGER, leases_waiting INTEGER,
+    waiting_on TEXT                 -- JSON: "job:N" / "lease:N" -> reason
+);
 """
 
 ACTIVE = ("running", "stopping")
@@ -253,6 +276,27 @@ class Store:
     def event(self, job_id, what, now=None) -> None:
         self.db.execute("INSERT INTO events (at, job_id, what) VALUES (?,?,?)",
                         (time.time() if now is None else now, job_id, what))
+
+    def attempt(self, kind: str, ref: int, outcome: str, ended_at: float, usage=None, **fields) -> None:
+        usage = usage or {}
+        row = dict(kind=kind, ref=ref, outcome=outcome, ended_at=ended_at,
+                   cpu_seconds=usage.get("cpu_seconds"), peak_mib=usage.get("peak_mib"),
+                   container_peak_mib=usage.get("container_peak_mib"), **fields)
+        self.db.execute(f"INSERT INTO attempts ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                        tuple(row.values()))
+
+    def attempts(self, kind: str, ref: int) -> List[Dict[str, Any]]:
+        rows = self.db.execute("SELECT * FROM attempts WHERE kind=? AND ref=? ORDER BY ended_at",
+                               (kind, ref)).fetchall()
+        return [dict(r) for r in rows]
+
+    def sample(self, at: float, **fields) -> None:
+        row = dict(at=at, **fields)
+        self.db.execute(f"INSERT INTO samples ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
+                        tuple(row.values()))
+
+    def prune_samples(self, before: float) -> None:
+        self.db.execute("DELETE FROM samples WHERE at<?", (before,))
 
     def events(self, since: float) -> List[Dict[str, Any]]:
         rows = self.db.execute("SELECT * FROM events WHERE at>=? ORDER BY at",

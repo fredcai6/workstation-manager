@@ -124,10 +124,15 @@ def meminfo(path: Path = Path("/proc/meminfo")) -> Tuple[int, int]:
 
 
 def unit_cgroup(unit: str) -> Optional[Path]:
-    r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit],
-                       capture_output=True, text=True)
-    cg = r.stdout.strip()
-    return Path("/sys/fs/cgroup" + cg) if cg else None
+    """The unit's cgroup. A bare name means a job's service or a `ws run` scope:
+    systemctl would read it as NAME.service only, and find no cgroup for a scope."""
+    for name in ([unit] if "." in unit else [f"{unit}.service", f"{unit}.scope"]):
+        r = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", name],
+                           capture_output=True, text=True)
+        cg = r.stdout.strip()
+        if cg:
+            return Path("/sys/fs/cgroup" + cg)
+    return None
 
 
 def memory_current_mib(cgroup: Optional[Path]) -> Optional[int]:
@@ -206,11 +211,44 @@ def container_ids(job_label: str) -> List[str]:
     return r.stdout.split()
 
 
+def container_cgroup(cid: str) -> Path:
+    return Path(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope")
+
+
+def own_cgroup() -> Optional[Path]:
+    """This process's cgroup (a job's wrapper: the job's unit)."""
+    try:
+        for line in Path("/proc/self/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                return Path("/sys/fs/cgroup" + line[3:])
+    except OSError:
+        pass
+    return None
+
+
+def cgroup_usage(cgroup: Optional[Path]) -> Tuple[Optional[float], Optional[int]]:
+    """(CPU seconds used, peak memory MiB) of a cgroup so far; None where unreadable."""
+    cpu_s = peak = None
+    if cgroup is None:
+        return None, None
+    try:
+        for line in (cgroup / "cpu.stat").read_text().splitlines():
+            if line.startswith("usage_usec "):
+                cpu_s = int(line.split()[1]) / 1e6
+    except (OSError, ValueError):
+        pass
+    try:
+        peak = int((cgroup / "memory.peak").read_text()) // (1024 * 1024)
+    except (OSError, ValueError):
+        pass
+    return cpu_s, peak
+
+
 def container_memory_mib(job_label: str) -> int:
     """Memory in use by a job's containers. They run under Docker, outside the job's unit."""
     total = 0
     for cid in container_ids(job_label):
-        total += memory_current_mib(Path(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope")) or 0
+        total += memory_current_mib(container_cgroup(cid)) or 0
     return total
 
 
