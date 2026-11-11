@@ -24,6 +24,7 @@ import re
 import signal
 import subprocess
 import sys
+from typing import Optional
 
 from . import board, config
 from .collector import collect
@@ -38,6 +39,70 @@ def parse_size(text: str) -> int:
         raise argparse.ArgumentTypeError(f"a size like 18G or 4500M, got {text!r}")
     value = float(m.group(1))
     return int(value * 1024) if (m.group(2) or "G").upper() == "G" else int(value)
+
+
+def parse_duration(text: str) -> int:
+    """Seconds from a duration like 2h, 90m, 1h30m or 45s (a bare number is minutes)."""
+    t = text.strip().lower()
+    if re.fullmatch(r"\d+(?:\.\d+)?", t):
+        return int(float(t) * 60)
+    m = re.fullmatch(r"(?:(\d+(?:\.\d+)?)h)?\s*(?:(\d+(?:\.\d+)?)m)?\s*(?:(\d+)s)?", t)
+    if not t or not m or not any(m.groups()):
+        raise argparse.ArgumentTypeError(f"a duration like 2h, 90m or 1h30m, got {text!r}")
+    h, mi, se = (float(g) if g else 0 for g in m.groups())
+    return int(h * 3600 + mi * 60 + se)
+
+
+def _expect(args, cmd: str) -> Optional[int]:
+    """--expect, else $WS_EXPECT (so a launcher script passes it through); None and a
+    message when neither is given."""
+    if args.expect is not None:
+        return args.expect
+    env = os.environ.get("WS_EXPECT")
+    if env:
+        try:
+            return parse_duration(env)
+        except argparse.ArgumentTypeError as exc:
+            print(f"ws {cmd}: WS_EXPECT: {exc}", file=sys.stderr)
+            return None
+    print(f"ws {cmd}: --expect is required: how long it should run, e.g. --expect 2h "
+          "(or set WS_EXPECT). It is an estimate: nothing is stopped for running over.",
+          file=sys.stderr)
+    return None
+
+
+def _ago_text(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}h" if seconds >= 5400 else f"{seconds / 60:.0f}m"
+
+
+def default_name(argv) -> str:
+    """The folder it runs in and the script, e.g. "cfb-oracle: two_sided_c_game.py":
+    an interpreter's name ("python") says nothing about whose work it is."""
+    prog = os.path.basename(argv[0])
+    script = next((os.path.basename(a) for a in argv[1:]
+                   if not a.startswith("-") and re.search(r"\.(py|sh|R|jl)$", a)), None)
+    if script is None and prog in ("python", "python3", "bash", "sh", "uv") and len(argv) > 1:
+        script = next((a for a in argv[1:] if not a.startswith("-")), None)
+    return f"{os.path.basename(os.getcwd())}: {script or prog}"
+
+
+def past_runs(store, name: str) -> str:
+    """What earlier runs of this name took and used, to guess --expect and --mem from."""
+    rows = store.db.execute(
+        "SELECT ended_at - started_at AS took FROM jobs WHERE name=? AND status='done'"
+        " AND started_at IS NOT NULL ORDER BY ended_at DESC LIMIT 5", (name,)).fetchall()
+    took = sorted(r["took"] for r in rows if r["took"] and r["took"] > 0)
+    peaks = sorted(r["peak_mib"] for r in store.db.execute(
+        "SELECT peak_mib FROM attempts WHERE name=? AND outcome IN ('done','ended')"
+        " AND peak_mib IS NOT NULL ORDER BY ended_at DESC LIMIT 5", (name,)).fetchall())
+    if not took and not peaks:
+        return ""
+    bits = []
+    if took:
+        bits.append(f"took {_ago_text(took[0])}" + (f"-{_ago_text(took[-1])}" if len(took) > 1 else ""))
+    if peaks:
+        bits.append(f"peak {peaks[0] / 1024:.1f}" + (f"-{peaks[-1] / 1024:.1f}" if len(peaks) > 1 else "") + " GB")
+    return f"earlier runs of {name} ({max(len(took), len(peaks))}): " + ", ".join(bits)
 
 
 def _store(cfg):
@@ -97,6 +162,9 @@ def cmd_submit(args, cfg) -> int:
     if args.mem is None:
         print("ws submit: --mem is required (peak memory, e.g. 8G)", file=sys.stderr)
         return 2
+    expect = _expect(args, "submit")
+    if expect is None:
+        return 2
     if _never_fits(cfg, args.cores, args.mem, "submit"):
         return 2
     if args.vram:
@@ -110,18 +178,21 @@ def cmd_submit(args, cfg) -> int:
     from . import runner
     from .store import describe
     store = _store(cfg)
-    name = args.name or os.path.basename(argv[0])
+    name = args.name or default_name(argv)
     owner = args.owner or os.environ.get("WS_OWNER") or getpass.getuser()
     job_id = store.submit(name, owner, args.vram, argv, os.getcwd(),
                           cfg.default_retries if args.retries is None else args.retries,
                           cfg.default_grace_seconds if args.grace is None else args.grace,
                           cores=args.cores, mem_mib=args.mem,
-                          priority=args.priority)
+                          priority=args.priority, expect_seconds=expect)
     runner.save_env(cfg, job_id, dict(os.environ))
     from .lease import poke
     poke(cfg)
-    print(f"submitted job #{job_id} ({name}, {describe(args.cores, args.mem or 0, args.vram)}); "
-          f"log: {cfg.job_dir(job_id) / 'log'}")
+    print(f"submitted job #{job_id} ({name}, {describe(args.cores, args.mem or 0, args.vram)}, "
+          f"expected {_ago_text(expect)}); log: {cfg.job_dir(job_id) / 'log'}")
+    hint = past_runs(store, name)
+    if hint:
+        print(hint)
     return 0
 
 
@@ -136,9 +207,17 @@ def cmd_run(args, cfg) -> int:
         os.execvp(argv[0], argv)
     if _never_fits(cfg, args.cores, args.mem, "run"):
         return 2
+    expect = _expect(args, "run")
+    if expect is None:
+        return 2
     unit = f"ws-run-{os.getpid()}"
-    name = args.name or os.path.basename(argv[0])
-    got = leases.acquire(cfg, "run", name, args.cores, args.mem, unit=unit)
+    name = args.name or default_name(argv)
+    if cfg.db_path.exists():
+        hint = past_runs(_store(cfg), name)
+        if hint:
+            print(f"ws: {hint}", file=sys.stderr)
+    got = leases.acquire(cfg, "run", name, args.cores, args.mem, unit=unit,
+                         priority=args.priority, expect_seconds=expect)
     cmd = argv
     if got is not None:
         leases.enter(got)
@@ -259,6 +338,10 @@ def main(argv=None) -> int:
     p.add_argument("--grace", type=int, help="Seconds between SIGTERM and SIGKILL (default 60).")
     p.add_argument("--priority", type=int, default=0,
                    help="Higher goes first and stops lower running jobs for the card (default 0).")
+    p.add_argument("--expect", type=parse_duration,
+                   help="How long it should run, e.g. 2h or 90m (required; or $WS_EXPECT). An estimate: "
+                        "it places the job on the page's timeline and lets it go ahead of the first in "
+                        "line when it should finish before that one could start.")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_submit)
 
@@ -266,6 +349,10 @@ def main(argv=None) -> int:
     p.add_argument("--cores", type=int, default=1, help="Physical cores (default 1).")
     p.add_argument("--mem", type=parse_size, required=True,
                    help="Peak memory, e.g. 8G; the command is killed past it.")
+    p.add_argument("--expect", type=parse_duration,
+                   help="How long it should run, e.g. 20m (required; or $WS_EXPECT).")
+    p.add_argument("--priority", type=int, default=0,
+                   help="Its place in the queue it shares with jobs (default 0).")
     p.add_argument("--name")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_run)

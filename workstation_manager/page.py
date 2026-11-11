@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .board import _ago, core_holders, host_summary
+from .board import _ago, core_holders, estimate, host_summary, runs_held
 from .store import describe
 
 # Reference palette (dataviz skill): categorical slots in fixed order, status
@@ -86,6 +86,12 @@ def _pri(p) -> str:
     p = p or 0
     cls = "hi" if p > 0 else ("lo" if p < 0 else "")
     return f'<span class="pri {cls}" title="priority {p}">{"+" if p > 0 else ""}{p}</span>'
+
+
+def _estimate_line(text: str, backfill) -> str:
+    cls = "warning" if text.startswith("over") else ("" if text == "no estimate" else "good")
+    extra = " · went ahead of the first in line on its estimate" if backfill else ""
+    return f'<div class="muted"><span class="st {cls}">{_e(text)}</span>{_e(extra)}</div>'
 
 
 def _job_colour(i: int) -> str:
@@ -231,32 +237,40 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                    f'<div class="n">{_e(b.get("model") or "")}'
                    f'{" → " + _e(b["want"]) if b.get("want") not in (None, b.get("model")) else ""}</div>'
                    f'<div class="n">{_e(hold)}</div></div>')
-        out.append(f'<div class="tile"><div class="k">Batch</div><div class="v">{len(s["running"])} running</div>'
-                   f'<div class="n">{len(s["queued"])} waiting</div></div>')
+        out.append(f'<div class="tile"><div class="k">Batch</div><div class="v">{len(s["running"]) + len(runs_held(s))} running</div>'
+                   f'<div class="n">{len(s.get("queue") or [])} waiting</div></div>')
         out.append(f'<div class="tile"><div class="k">Broker</div><div class="v">'
                    f'<span class="st {"critical" if stale else "good"}">{"stale" if stale else "running"}</span></div>'
                    f'<div class="n">{"TAKEN by operator · " if s["take"] else ""}last tick {_ago(b["age_seconds"])} ago</div></div>')
         out.append("</div>")
 
         out.append("<h2>Running</h2>")
-        if not s["running"]:
+        runs = runs_held(s)
+        if not s["running"] and not runs:
             out.append('<p class="empty">Nothing running.</p>')
         for i, j in enumerate(s["running"]):
             log = ""
             if j.get("log_at"):
                 log = f'<div class="log">last output {_ago(now - j["log_at"])} ago: {_e(j.get("log_last"))}</div>'
+            est = estimate(s, f"job:{j['id']}", j["started_at"], j.get("expect_seconds"))
             out.append(
                 f'<div class="job"><div class="t"><span class="name">#{j["id"]} {_e(j["name"])}</span>'
                 f'<span class="muted">{_pri(j.get("priority"))} · {_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))} · started {_ago(now - (j["started_at"] or now))} ago'
                 f'</span></div>'
-                f'{_progress(j, _job_colour(i))}{log}</div>')
+                f'{_progress(j, _job_colour(i))}{_estimate_line(est, j.get("backfill"))}{log}</div>')
+        for l in runs:
+            est = estimate(s, f"lease:{l['id']}", l["granted_at"], l.get("expect_seconds"))
+            out.append(
+                f'<div class="job"><div class="t"><span class="name">ws run #{l["id"]} {_e(l["name"])}</span>'
+                f'<span class="muted">{_pri(l.get("priority"))} · {_e(describe(l["cores"], l["mem_mib"], 0))} · '
+                f'started {_ago(now - l["granted_at"])} ago</span></div>'
+                f'{_estimate_line(est, False)}<div class="log">{_e(l.get("cwd") or "")}</div></div>')
 
-        out.append("<h2>Leases (pytest, ws run)</h2>")
-        if not s.get("leases"):
-            out.append('<p class="empty">None.</p>')
-        else:
-            out.append('<table><tr><th>Lease</th><th>Holds</th><th>State</th></tr>')
-            for l in s["leases"]:
+        fast = [l for l in s.get("leases", ()) if l.get("fast")]
+        if fast:
+            out.append("<h2>pytest (the fast lane)</h2>")
+            out.append('<table><tr><th>Run</th><th>Holds</th><th>State</th></tr>')
+            for l in fast:
                 when = l["granted_at"] if l["status"] == "granted" else l["requested_at"]
                 state = f'{"held" if l["status"] == "granted" else "waiting"} {_ago(now - when)}'
                 reason = why.get(f"lease:{l['id']}") if l["status"] != "granted" else None
@@ -266,20 +280,24 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
             out.append("</table>")
 
         out.append("<h2>Queue</h2>")
-        if not s["queued"]:
+        q = s.get("queue") or []
+        proj = b.get("projection") or {}
+        if not q:
             out.append('<p class="empty">Empty.</p>')
         else:
             counts: Dict[int, int] = {}
-            for j in s["queued"]:
+            for j in q:
                 counts[j.get("priority") or 0] = counts.get(j.get("priority") or 0, 0) + 1
             stack = " · ".join(f"{_pri(p)} {n} waiting" for p, n in sorted(counts.items(), reverse=True))
-            out.append(f'<p class="muted">In the order they start: highest priority first, then first come. '
-                       f'A job that needs the card stops running jobs of lower priority that keep it off. '
-                       f'Leases go ahead of all of them.</p><p class="muted">{stack}</p>')
+            out.append(f'<p class="muted">Jobs and <code>ws run</code> commands, in the order they start: highest '
+                       f'priority first, then first come. A later job may go ahead when its estimate has it done '
+                       f'before the first in line could start; if it runs over, it is stopped and requeued. '
+                       f'A job that needs the card stops running jobs of lower priority. pytest runs skip the queue. '
+                       f'Start times are estimates from what everyone declared.</p><p class="muted">{stack}</p>')
             out.append('<table><tr><th class="num">#</th><th>Priority</th><th>Job</th><th>Needs</th>'
-                       '<th>Waiting</th><th>Held up by</th></tr>')
+                       '<th>Expect</th><th>Waiting</th><th>Starts</th><th>Held up by</th></tr>')
             prev = None
-            for n, j in enumerate(s["queued"], 1):
+            for n, j in enumerate(q, 1):
                 notes = []
                 if j["interruptions"]:
                     notes.append(f"{j['interruptions']} interruption(s)")
@@ -290,13 +308,17 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                 pri = j.get("priority") or 0
                 band = ' class="band"' if prev is not None and pri != prev else ""
                 prev = pri
-                reason = why.get(f"job:{j['id']}") or "starting"
+                reason = why.get(j["key"]) or "starting"
                 note = f'<div class="why">{_e(", ".join(notes))}</div>' if notes else ""
+                pj = proj.get(j["key"])
+                starts = ("now" if pj[0] <= now + 60 else f"~{time.strftime('%H:%M', time.localtime(pj[0]))}") \
+                    if pj and pj[0] else '<span title="behind work with no estimate">?</span>'
+                exp = _ago(j["expect_seconds"]) if j.get("expect_seconds") else '<span class="why">none</span>'
                 out.append(f'<tr{band}><td class="num">{n}</td><td>{_pri(pri)}</td>'
-                           f'<td>#{j["id"]} {_e(j["name"])}'
-                           f'{note}</td>'
+                           f'<td>{_e(j["label"])}{note}</td>'
                            f'<td>{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))}</td>'
-                           f'<td>{_ago(now - j["submitted_at"])}</td><td class="why">{_e(reason)}</td></tr>')
+                           f'<td>{exp}</td><td>{_ago(now - j["submitted_at"])}</td><td>{starts}</td>'
+                           f'<td class="why">{_e(reason)}</td></tr>')
             out.append("</table>")
 
         out.append("<h2>Finished</h2>")

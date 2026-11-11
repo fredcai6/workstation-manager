@@ -40,10 +40,43 @@ def snapshot(cfg: Config, store: Store, now: float = None) -> Dict[str, Any]:
         "hold_seconds_left": hold_left,
         "running": [{**j.to_dict(), **log_activity(cfg, j.id)} for j in store.jobs(ACTIVE)],
         "queued": [j.to_dict() for j in store.jobs(("queued",))],
-        "leases": [dataclasses.asdict(l) for l in store.leases()],
+        "leases": [{**dataclasses.asdict(l), "fast": l.fast} for l in store.leases()],
+        "queue": queue_view(store),
         "recent": [j.to_dict() for j in store.recent(10)],
         "events": store.events(now - 86400),
     }
+
+
+def queue_view(store: Store) -> List[Dict[str, Any]]:
+    """The queue as the scheduler orders it: jobs and waiting `ws run` commands."""
+    from .scheduler import queue_order
+    items = queue_order(store.jobs(("queued",)) + [l for l in store.leases(("waiting",)) if not l.fast])
+    out = []
+    for h in items:
+        if hasattr(h, "submitted_at"):
+            out.append({**h.to_dict(), "kind": "job", "key": h.key, "label": f"#{h.id} {h.name}"})
+        else:
+            out.append({**dataclasses.asdict(h), "kind": "run", "key": h.key, "vram_mib": 0,
+                        "submitted_at": h.requested_at, "interruptions": 0, "failures": 0,
+                        "legacy": False, "label": f"ws run #{h.id} {h.name}"})
+    return out
+
+
+def runs_held(s: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """`ws run` commands that hold their cores: running work, like jobs."""
+    return [l for l in s.get("leases", ()) if l["status"] == "granted" and not l.get("fast")]
+
+
+def estimate(s: Dict[str, Any], key: str, started: Optional[float], expect: Optional[int]) -> str:
+    """e.g. "expected 2.0h, ends ~14:10" or "over its 1.0h estimate by 40m"."""
+    now = s["at"]
+    proj = (((s.get("broker") or {}).get("projection")) or {}).get(key)
+    if not expect:
+        return "no estimate"
+    if started and now > started + expect:
+        return f"over its {_ago(expect)} estimate by {_ago(now - started - expect)}"
+    end = proj[1] if proj and proj[1] else (started + expect if started else None)
+    return f"expected {_ago(expect)}" + (f", ends ~{time.strftime('%H:%M', time.localtime(end))}" if end else "")
 
 
 def core_holders(s: Dict[str, Any]) -> List[Optional[str]]:
@@ -146,29 +179,42 @@ def render_text(s: Dict[str, Any]) -> str:
         out.append(f"  Memory: {h['mem_available_mib'] / 1024:.1f} GB available of "
                    f"{h['mem_total_mib'] / 1024:.1f}; {h['mem_declared_mib'] / 1024:.1f} GB declared by holders"
                    + (f"; room for new work {h['mem_room_mib'] / 1024:.1f} GB" if h.get("mem_room_mib") is not None else ""))
-    leases = s.get("leases", ())
-    if leases:
-        out.append("  Leases (pytest, ws run):")
-    for l in leases:
+    fast = [l for l in s.get("leases", ()) if l.get("fast")]
+    if fast:
+        out.append("  pytest (the fast lane):")
+    for l in fast:
         when = l["granted_at"] if l["status"] == "granted" else l["requested_at"]
         out.append(f"    lease #{l['id']} {l['name']}  {describe(l['cores'], l['mem_mib'], 0)}  "
                    f"{'held' if l['status'] == 'granted' else 'waiting'} {_ago(now - when)}"
-                   + (f"  cpus {','.join(map(str, l['cpus']))}" if l.get("cpus") else "")
                    + (f"  [{why[f'lease:{l['id']}']}]" if l["status"] != "granted"
                       and f"lease:{l['id']}" in why else ""))
-    out.append("  Running:" if s["running"] else "  Running: none")
+    runs = runs_held(s)
+    out.append("  Running:" if s["running"] or runs else "  Running: none")
     for j in s["running"]:
         out.append(f"    #{j['id']} {j['name']}  {describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  {j['status']}"
                    f"  {_progress(j)}  started {_ago(now - (j['started_at'] or now))} ago"
-                   + (f", priority {j['priority']}" if j.get("priority") else ""))
+                   + (f", priority {j['priority']}" if j.get("priority") else "")
+                   + f"; {estimate(s, f'job:{j['id']}', j['started_at'], j.get('expect_seconds'))}"
+                   + ("; went ahead on its estimate" if j.get("backfill") else ""))
         if j.get("log_at"):
             out.append(f"      last output {_ago(now - j['log_at'])} ago: {j['log_last'] or ''}")
-    out.append("  Queue:" if s["queued"] else "  Queue: empty")
-    for n, j in enumerate(s["queued"], 1):
+    for l in runs:
+        out.append(f"    ws run #{l['id']} {l['name']}  {describe(l['cores'], l['mem_mib'], 0)}  "
+                   f"running {_ago(now - l['granted_at'])}"
+                   + (f"  cpus {','.join(map(str, l['cpus']))}" if l.get("cpus") else "")
+                   + (f", priority {l['priority']}" if l.get("priority") else "")
+                   + f"; {estimate(s, f'lease:{l['id']}', l['granted_at'], l.get('expect_seconds'))}")
+    q = s.get("queue", ())
+    out.append("  Queue (jobs and ws run, in the order they start):" if q else "  Queue: empty")
+    proj = b.get("projection") or {}
+    for n, j in enumerate(q, 1):
         extra = f", {j['interruptions']} interruption(s)" if j["interruptions"] else ""
-        out.append(f"    {n}. [{j.get('priority') or 0:+d}] #{j['id']} {j['name']}  "
+        p = proj.get(j["key"])
+        when = f", starts ~{time.strftime('%H:%M', time.localtime(p[0]))}" if p and p[0] and p[0] > now + 60 else ""
+        exp = f", expected {_ago(j['expect_seconds'])}" if j.get("expect_seconds") else ", no estimate"
+        out.append(f"    {n}. [{j.get('priority') or 0:+d}] {j['label']}  "
                    f"{describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  waiting "
-                   f"{_ago(now - j['submitted_at'])}{extra}")
-        if f"job:{j['id']}" in why:
-            out.append(f"       held up by: {why[f'job:{j['id']}']}")
+                   f"{_ago(now - j['submitted_at'])}{exp}{when}{extra}")
+        if j["key"] in why:
+            out.append(f"       held up by: {why[j['key']]}")
     return "\n".join(out)

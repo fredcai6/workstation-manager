@@ -36,7 +36,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     mem_mib INTEGER NOT NULL DEFAULT 0,
     cpus TEXT,
     legacy INTEGER NOT NULL DEFAULT 0,
-    priority INTEGER NOT NULL DEFAULT 0
+    priority INTEGER NOT NULL DEFAULT 0,
+    expect_seconds INTEGER,
+    backfill INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS leases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +55,9 @@ CREATE TABLE IF NOT EXISTS leases (
     requested_at REAL NOT NULL,
     granted_at REAL,
     ended_at REAL,
-    cpus TEXT
+    cpus TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    expect_seconds INTEGER
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
@@ -70,7 +74,8 @@ CREATE TABLE IF NOT EXISTS attempts (
     cores INTEGER, mem_mib INTEGER, vram_mib INTEGER, priority INTEGER,
     cpu_seconds REAL,               -- unit plus containers
     peak_mib INTEGER,               -- unit plus containers
-    container_peak_mib INTEGER
+    container_peak_mib INTEGER,
+    expect_seconds INTEGER
 );
 CREATE INDEX IF NOT EXISTS attempts_ref ON attempts (kind, ref);
 -- The whole box once a minute, and what holds up each waiting job and lease.
@@ -88,7 +93,10 @@ ACTIVE = ("running", "stopping")
 # Columns added after the first schema, with their definitions, for older databases.
 JOB_COLUMNS = {"cores": "INTEGER NOT NULL DEFAULT 1", "mem_mib": "INTEGER NOT NULL DEFAULT 0",
                "cpus": "TEXT", "legacy": "INTEGER NOT NULL DEFAULT 0",
-               "priority": "INTEGER NOT NULL DEFAULT 0"}
+               "priority": "INTEGER NOT NULL DEFAULT 0", "expect_seconds": "INTEGER",
+               "backfill": "INTEGER NOT NULL DEFAULT 0"}
+LEASE_COLUMNS = {"priority": "INTEGER NOT NULL DEFAULT 0", "expect_seconds": "INTEGER"}
+ATTEMPT_COLUMNS = {"expect_seconds": "INTEGER"}
 
 
 @dataclasses.dataclass
@@ -123,6 +131,16 @@ class Job:
     legacy: bool = False
     # Higher goes first in the queue, and stops running jobs below it that keep it off the card.
     priority: int = 0
+    expect_seconds: Optional[int] = None  # how long it should run (an estimate; never enforced)
+    backfill: bool = False          # started ahead of the first in line, on its estimate
+
+    @property
+    def key(self) -> str:
+        return f"job:{self.id}"
+
+    @property
+    def queued_at(self) -> float:
+        return self.submitted_at
 
     @property
     def unit(self) -> str:
@@ -149,6 +167,24 @@ class Lease:
     granted_at: Optional[float]
     ended_at: Optional[float]
     cpus: Optional[List[int]]
+    priority: int = 0
+    expect_seconds: Optional[int] = None
+
+    vram_mib = 0                    # leases hold no VRAM
+    legacy = False
+
+    @property
+    def key(self) -> str:
+        return f"lease:{self.id}"
+
+    @property
+    def queued_at(self) -> float:
+        return self.requested_at
+
+    @property
+    def fast(self) -> bool:
+        """pytest: short, a caller blocked on it. It skips the queue; `ws run` waits in it."""
+        return self.kind == "pytest"
 
 
 def describe(cores: int, mem_mib: int, vram_mib: int, legacy: bool = False) -> str:
@@ -174,17 +210,22 @@ class Store:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
                 if col == "legacy":  # every job so far was submitted under the old names
                     self.db.execute("UPDATE jobs SET legacy=1")
+        for table, cols in (("leases", LEASE_COLUMNS), ("attempts", ATTEMPT_COLUMNS)):
+            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for col, ddl in cols.items():
+                if col not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
     # -- jobs -------------------------------------------------------------
     def submit(self, name, owner, vram_mib, argv, cwd, retries, grace_seconds,
-               now=None, cores=1, mem_mib=0, legacy=False, priority=0) -> int:
+               now=None, cores=1, mem_mib=0, legacy=False, priority=0, expect_seconds=None) -> int:
         now = time.time() if now is None else now
         cur = self.db.execute(
             "INSERT INTO jobs (name, owner, vram_mib, argv, cwd, retries, grace_seconds,"
-            " status, submitted_at, cores, mem_mib, legacy, priority)"
-            " VALUES (?,?,?,?,?,?,?, 'queued', ?,?,?,?,?)",
+            " status, submitted_at, cores, mem_mib, legacy, priority, expect_seconds)"
+            " VALUES (?,?,?,?,?,?,?, 'queued', ?,?,?,?,?,?)",
             (name, owner, vram_mib, json.dumps(argv), cwd, retries, grace_seconds, now,
-             cores, mem_mib, int(legacy), priority))
+             cores, mem_mib, int(legacy), priority, expect_seconds))
         self.event(cur.lastrowid, f"submitted ({describe(cores, mem_mib, vram_mib)})", now)
         return cur.lastrowid
 
@@ -193,6 +234,7 @@ class Store:
         d["argv"] = json.loads(d["argv"])
         d["cpus"] = json.loads(d["cpus"]) if d.get("cpus") else None
         d["legacy"] = bool(d.get("legacy"))
+        d["backfill"] = bool(d.get("backfill"))
         return Job(**d)
 
     def get(self, job_id: int) -> Optional[Job]:
@@ -230,12 +272,12 @@ class Store:
 
     # -- leases: foreground work (pytest, `ws run`) holding cores while it runs --
     def request_lease(self, kind, name, owner, pid, pid_start, cores, mem_mib, cwd,
-                      unit=None, now=None) -> int:
+                      unit=None, now=None, priority=0, expect_seconds=None) -> int:
         cur = self.db.execute(
             "INSERT INTO leases (kind, name, owner, pid, pid_start, cores, mem_mib, cwd, unit,"
-            " status, requested_at) VALUES (?,?,?,?,?,?,?,?,?, 'waiting', ?)",
+            " status, requested_at, priority, expect_seconds) VALUES (?,?,?,?,?,?,?,?,?, 'waiting', ?,?,?)",
             (kind, name, owner, pid, pid_start, cores, mem_mib, cwd, unit,
-             time.time() if now is None else now))
+             time.time() if now is None else now, priority, expect_seconds))
         return cur.lastrowid
 
     def lease(self, lease_id: int) -> Optional[Lease]:
