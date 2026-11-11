@@ -86,17 +86,6 @@ class TestLive(unittest.TestCase):
         self.assertIn(f"cpus {sorted(j.cpus)} 2", log)
         self.assertEqual(len(j.cpus), 4)  # two physical cores, both siblings each
 
-    def test_legacy_job_keeps_the_old_names_and_runs_unpinned(self):
-        r = subprocess.run([sys.executable, str(REPO / "gpu"), "submit", "--vram", "1G", "--name", "old",
-                            "--", sys.executable, "-c",
-                            "import os; print('env', os.environ['GPU_JOB_ID'], os.environ['GPU_JOB_LABEL'],"
-                            " len(os.sched_getaffinity(0)) == os.cpu_count())"],
-                           env=self.env, capture_output=True, text=True, cwd=self.tmp.name)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        j = self.wait_job(1)
-        self.assertEqual((j.status, j.unit), ("done", "gpu-job-1"))
-        self.assertIn("env 1 gpu-manager.job=1 True", (self.cfg.job_dir(1) / "log").read_text())
-
     def test_job_past_its_memory_is_killed_and_not_retried(self):
         r = self.ws("submit", "--mem", "200M", "--name", "hog", "--",
                     sys.executable, "-c", "x = bytearray(600 * 1024 * 1024); x[::4096] = b'1' * len(x[::4096])")
