@@ -51,7 +51,8 @@ def limits(cfg: Config):
 
 def acquire(cfg: Config, kind: str, name: str, cores: int, mem_mib: int,
             unit: Optional[str] = None, wait_limit: Optional[float] = None,
-            out: TextIO = sys.stderr) -> Optional[Lease]:
+            out: TextIO = sys.stderr, priority: int = 0,
+            expect_seconds: Optional[int] = None) -> Optional[Lease]:
     """Wait for a lease. None when the broker is not running or the wait ran past
     `wait_limit`: the caller then runs unpinned."""
     if not cfg.db_path.exists():
@@ -65,10 +66,12 @@ def acquire(cfg: Config, kind: str, name: str, cores: int, mem_mib: int,
     owner = os.environ.get("WS_OWNER") or getpass.getuser()
     pid = os.getpid()
     lease_id = store.request_lease(kind, name, owner, pid, cpu.process_start(pid), cores,
-                                   mem_mib, os.getcwd(), unit)
+                                   mem_mib, os.getcwd(), unit, priority=priority,
+                                   expect_seconds=expect_seconds)
     poke(cfg)
     start = time.time()
     said = False
+    told = None                     # the last reason printed, so a change is printed once
     try:
         while True:
             lease = store.lease(lease_id)
@@ -82,6 +85,11 @@ def acquire(cfg: Config, kind: str, name: str, cores: int, mem_mib: int,
                 print(f"ws: waiting for {describe(cores, mem_mib, 0)} ({ahead(store, lease)}); "
                       "`ws status` shows who holds them", file=out)
                 said = True
+            if said and kind == "run":
+                why = ((store.get_kv("daemon") or {}).get("waiting_on") or {}).get(lease.key)
+                if why and why != told:
+                    print(f"ws: held up by: {why}", file=out)
+                    told = why
             if wait_limit is not None and waited > wait_limit:
                 store.end_lease(lease_id)
                 print(f"ws: waited {waited:.0f}s; running without a core lease", file=out)
@@ -98,11 +106,19 @@ def acquire(cfg: Config, kind: str, name: str, cores: int, mem_mib: int,
 
 
 def ahead(store: Store, lease: Lease) -> str:
-    before = [l for l in store.leases(("waiting",)) if l.id < lease.id]
     held_by = store.leases(("granted",))
     bits = [f"{len(held_by)} lease(s) and {len(store.jobs(('running',)))} job(s) running"]
-    if before:
-        bits.append(f"{len(before)} lease(s) ahead")
+    if lease.fast:
+        before = [l for l in store.leases(("waiting",)) if l.fast and l.id < lease.id]
+        if before:
+            bits.append(f"{len(before)} pytest run(s) ahead")
+    else:
+        # A `ws run` waits in the queue it shares with jobs.
+        from .scheduler import queue_order
+        q = queue_order(store.jobs(("queued",)) + [l for l in store.leases(("waiting",)) if not l.fast])
+        n = next((i for i, h in enumerate(q) if h.key == lease.key), 0)
+        if n:
+            bits.append(f"{n} ahead of it in the queue")
     return ", ".join(bits)
 
 

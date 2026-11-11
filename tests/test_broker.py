@@ -385,3 +385,22 @@ class TestUnitCgroup(unittest.TestCase):
         with mock.patch.object(cpu.subprocess, "run", side_effect=show):
             self.assertEqual(cpu.unit_cgroup("ws-run-7"), Path("/sys/fs/cgroup/app.slice/ws-run-7.scope"))
         self.assertEqual(seen, ["ws-run-7.service", "ws-run-7.scope"])
+
+
+class TestCliEstimates(unittest.TestCase):
+    def test_durations(self):
+        from workstation_manager.cli import parse_duration
+        for text, secs in (("2h", 7200), ("90m", 5400), ("1h30m", 5400), ("45s", 45), ("20", 1200),
+                           ("1.5h", 5400)):
+            self.assertEqual(parse_duration(text), secs, text)
+        for bad in ("", "soon", "2d"):
+            with self.assertRaises(Exception):
+                parse_duration(bad)
+
+    def test_default_name_says_whose_work_it_is(self):
+        from workstation_manager.cli import default_name
+        with mock.patch("os.getcwd", return_value="/home/t/projects/wt/cfb-oracle"):
+            self.assertEqual(default_name(["/x/.venv/bin/python", "research/two_sided_c_game.py", "passers"]),
+                             "cfb-oracle: two_sided_c_game.py")
+            self.assertEqual(default_name(["bash", "scratch/pass4/t1.sh"]), "cfb-oracle: t1.sh")
+            self.assertEqual(default_name(["make", "fit"]), "cfb-oracle: make")

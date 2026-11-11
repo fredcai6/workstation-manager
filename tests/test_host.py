@@ -257,3 +257,105 @@ class TestWhyWaiting(unittest.TestCase):
     def test_reasons_change_no_decision(self):
         v = hview(queued=[cjob(1, mem=16 * GB), cjob(2)], leases=[lease(7, mem=30 * GB)], avail=20 * GB)
         self.assertEqual(run(v), self.why(v)[0])
+
+
+def rlease(id, cores=1, mem=2 * GB, priority=0, expect=None, requested=None, status="waiting", cpus=None):
+    """A `ws run` lease: it waits in the queue with jobs."""
+    return dataclasses.replace(lease(id, cores, mem, status, cpus), kind="run", priority=priority,
+                               expect_seconds=expect,
+                               requested_at=float(id) if requested is None else requested)
+
+
+def held(id, cores, start=9_000.0, expect=None, backfill=False, mem=2 * GB, vram=0):
+    """A job running on the first `cores` physical cores."""
+    cpus = [c for core in CORES[:cores] for c in core]
+    return dataclasses.replace(cjob(id, cores=cores, mem=mem, vram=vram, status="running", cpus=cpus),
+                               started_at=start, expect_seconds=expect, backfill=backfill)
+
+
+class TestOneQueue(unittest.TestCase):
+    """Jobs and `ws run` share one queue; pytest keeps its fast lane."""
+
+    def test_ws_run_takes_its_place_by_priority(self):
+        busy = held(9, 6)
+        acts = run(hview(queued=[cjob(1, cores=2)], leases=[rlease(7, cores=2, priority=5)],
+                         active=[busy], lease_reserve=2))
+        self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])
+        acts = run(hview(queued=[dataclasses.replace(cjob(1, cores=2), priority=9)],
+                         leases=[rlease(7, cores=2, priority=5)], active=[busy], lease_reserve=2))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 1)])
+
+    def test_ws_run_is_held_back_for_an_earlier_job(self):
+        why = {}
+        acts = decide(hview(queued=[cjob(1, cores=8)], active=[held(9, 4)],
+                                                   leases=[rlease(7, cores=2, requested=50_000)],
+                                                   lease_reserve=2), MARGIN, 12500, 30, False, why)
+        self.assertEqual(acts, [])
+        self.assertEqual(why["lease:7"], "held back for #1 (first in line)")
+
+    def test_only_pytest_uses_the_kept_cores_and_skips_unmanaged_load(self):
+        acts = run(hview(leases=[rlease(7, cores=9)], lease_reserve=2))
+        self.assertEqual(acts, [])
+        acts = run(hview(leases=[lease(8, cores=9)], lease_reserve=2))
+        self.assertEqual([a[:2] for a in acts], [("grant_lease", 8)])
+        acts = run(hview(leases=[rlease(7, cores=2)], busy=[1.0] * 12))
+        self.assertEqual(acts, [])
+
+
+class TestEstimates(unittest.TestCase):
+    """A later job goes ahead of the first in line only if it should finish before that one
+    could start, and makes way if it runs over."""
+
+    def setUp(self):
+        # 8 cores for batch; a 4-core job runs until 13_600 (1h estimate from 10_000).
+        self.busy = held(9, 4, start=10_000.0, expect=3600)
+        self.head = cjob(1, cores=8)
+
+    def go(self, later, active=None):
+        return run(hview(queued=[self.head, later], active=active or [self.busy], lease_reserve=2))
+
+    def test_short_job_fills_the_gap(self):
+        later = dataclasses.replace(cjob(2, cores=2), expect_seconds=1800)
+        (act,) = self.go(later)
+        self.assertEqual((act[0], act[1], len(act[2]), act[3]), ("start_job", 2, 4, "backfill"))
+
+    def test_too_long_or_unestimated_job_waits(self):
+        self.assertEqual(self.go(dataclasses.replace(cjob(2, cores=2), expect_seconds=7200)), [])
+        self.assertEqual(self.go(cjob(2, cores=2)), [])
+        unknown = dataclasses.replace(self.busy, expect_seconds=None)
+        self.assertEqual(self.go(dataclasses.replace(cjob(2, cores=2), expect_seconds=60), [unknown]), [])
+
+    def test_ws_run_never_jumps_on_an_estimate(self):
+        acts = run(hview(queued=[self.head], leases=[rlease(7, cores=2, expect=60, requested=50_000)],
+                         active=[self.busy], lease_reserve=2))
+        self.assertEqual(acts, [])
+
+    def test_job_that_went_ahead_and_ran_over_makes_way(self):
+        over = held(5, 4, start=5_000.0, expect=1800, backfill=True)
+        busy = dataclasses.replace(self.busy, cpus=[c for core in CORES[4:8] for c in core])
+        acts = run(hview(queued=[self.head], active=[busy, over], lease_reserve=2))
+        self.assertEqual(acts, [])  # stopping it alone would not make 8 cores
+        acts = run(hview(queued=[cjob(1, cores=4)], active=[busy, over], lease_reserve=2))
+        self.assertEqual(acts, [("stop_job", 5, "requeue")])
+        not_over = dataclasses.replace(over, expect_seconds=99_999)
+        self.assertEqual(run(hview(queued=[cjob(1, cores=4)], active=[busy, not_over], lease_reserve=2)), [])
+
+    def test_projection_is_a_timeline(self):
+        from workstation_manager.scheduler import project
+        a = dataclasses.replace(cjob(1, cores=8), expect_seconds=3600)
+        b = dataclasses.replace(cjob(2, cores=4), expect_seconds=600)
+        c = cjob(3, cores=8)
+        d = cjob(4, cores=8)
+        p = project(hview(queued=[a, b, c, d], active=[self.busy], lease_reserve=2), MARGIN)
+        self.assertEqual(p["job:9"][1], 13_600.0)
+        self.assertEqual(p["job:1"][:2], (13_600.0, 17_200.0))
+        self.assertEqual(p["job:2"][:2], (17_200.0, 17_800.0))
+        self.assertEqual(p["job:3"][:2], (17_800.0, None))
+        self.assertEqual(p["job:4"][:2], (None, None))  # behind a job with no estimate
+
+    def test_progress_beats_the_estimate_once_a_quarter_is_done(self):
+        from workstation_manager.scheduler import expected_end
+        j = dataclasses.replace(self.busy, started_at=6_000.0, chunk=3, chunks=4)  # half done at 4,000s
+        self.assertEqual(expected_end(j, 10_000.0), (14_000.0, False))
+        late = dataclasses.replace(self.busy, started_at=1_000.0, chunk=None, chunks=None)
+        self.assertEqual(expected_end(late, 10_000.0), (10_600.0, True))

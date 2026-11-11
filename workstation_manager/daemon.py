@@ -108,7 +108,7 @@ class Daemon:
             elif job.stop_request == "requeue":
                 self.store.update(job.id, status="queued", interruptions=job.interruptions + 1,
                                   exit_code=res["exit_code"], stop_request=None)
-                self.store.event(job.id, "stopped for the card; requeued")
+                self.store.event(job.id, "stopped to make room; requeued")
             elif res["exit_code"] == 0:
                 self.store.update(job.id, status="done", ended_at=now, exit_code=0)
                 self.store.event(job.id, "done")
@@ -150,7 +150,7 @@ class Daemon:
                            started_at=before.started_at,
                            exit_code=None if res is None else res.get("exit_code"),
                            cores=cpu_cores(before), mem_mib=before.mem_mib, vram_mib=before.vram_mib,
-                           priority=before.priority)
+                           priority=before.priority, expect_seconds=before.expect_seconds)
         text = usage_text(usage, cpu_cores(before), before.mem_mib)
         if text:
             self.store.event(before.id, text)
@@ -164,7 +164,8 @@ class Daemon:
                 self.store.attempt("lease", lease.id, "ended" if lease.granted_at else "gave up", now,
                                    usage, name=f"{lease.kind} {lease.name}",
                                    started_at=lease.granted_at or lease.requested_at,
-                                   cores=lease.cores, mem_mib=lease.mem_mib, vram_mib=0)
+                                   cores=lease.cores, mem_mib=lease.mem_mib, vram_mib=0,
+                                   priority=lease.priority, expect_seconds=lease.expect_seconds)
         self.store.prune_leases(time.time() - 86400)
 
     def _cgroup(self, unit: str):
@@ -334,11 +335,12 @@ class Daemon:
                 self.store.grant_lease(act[1], act[2])
             elif kind == "start_job":
                 job = self.store.get(act[1])
+                backfill = len(act) > 3 and act[3] == "backfill"
                 if not os.path.isdir(job.cwd):
                     self.store.update(job.id, status="failed", ended_at=time.time())
                     self.store.event(job.id, f"not started: its directory {job.cwd} is gone")
                     continue
-                if len(act) > 2:
+                if len(act) > 2 and act[2] is not None:
                     self.store.update(job.id, cpus=act[2])
                     job = self.store.get(job.id)
                 try:
@@ -347,8 +349,10 @@ class Daemon:
                     self.store.event(job.id, f"could not start: {exc}")
                     log.exception("start %s", job.id)
                     continue
-                self.store.update(job.id, status="running", started_at=time.time(), stop_request=None)
-                self.store.event(job.id, "started")
+                self.store.update(job.id, status="running", started_at=time.time(), stop_request=None,
+                                  backfill=backfill)
+                self.store.event(job.id, "started ahead of the first in line, on its estimate"
+                                 if backfill else "started")
             elif kind == "stop_job":
                 job = self.store.get(act[1])
                 self.store.update(job.id, status="stopping", stop_request=act[2])
@@ -417,6 +421,8 @@ class Daemon:
                                      "services": {n: self.svc_state[n] for n in self.cfg.services},
                                      "reserved": self.cfg.reserved(now),
                                      "waiting_on": why,
+                                     "projection": {k: list(v) for k, v in
+                                                    scheduler.project(view, self.cfg.margin_mib).items()},
                                      "cpu": {"cores": [list(c) for c in cpu_view.cores],
                                              "busy": [round(b, 3) for b in cpu_view.busy],
                                              "reserve": cpu_view.reserve,

@@ -30,12 +30,21 @@ Rules, in order:
    `lease_reserve` cores are kept for leases: batch never takes them. A job gets whole physical cores, least busy first
    in CCD-alternating order. The rules above about the card apply to jobs that
    declare VRAM; a CPU-only job neither waits for the pair nor sends it away.
-10. A lease (a foreground pytest or `ws run`: a caller is waiting) is granted ahead
-   of queued batch, first come first served, even during a take: it holds no VRAM.
+10. pytest runs are the fast lane: granted ahead of the queue, first come first served,
+   even during a take; they count declarations only and may use the `lease_reserve`
+   cores. A `ws run` waits in the queue with jobs: same order, same room checks, and
+   it is granted where a job would start (it runs in its caller's terminal).
 11. Priority: the queue is in priority order (highest first, then first come). When
    the first job waiting for the card cannot fit, running jobs of lower priority are
    stopped and requeued, newest first, until it would, if stopping them is enough.
    Jobs that are already stopping count as gone. Not during a reserve window.
+12. Estimates: every job and `ws run` says how long it should run (--expect). A later
+   job that does not leave room for the first in line may still start if its estimate
+   has it done before the first in line could start (project(): holders end at their
+   estimates, or by their progress once a quarter is done). If it runs past its
+   estimate while the first in line waits, it is stopped and requeued, newest first,
+   when that makes room. A `ws run` never goes ahead this way: it cannot be stopped.
+   Nothing else is ever stopped for running over.
 """
 
 from __future__ import annotations
@@ -121,7 +130,8 @@ class Host:
         granted = [l for l in v.leases if l.status == "granted"]
         holders = list(v.active) + granted
         self.cores_committed = sum(cores_of(h) for h in holders)
-        self.lease_cores = sum(l.cores for l in granted)
+        # Cores held by pytest runs, the fast lane `lease_reserve` is kept for.
+        self.fast_cores = sum(l.cores for l in granted if l.fast)
         self.mem_committed = sum(h.mem_mib for h in holders)
         if self.cpu:
             where = {c: i for i, core in enumerate(self.cpu.cores) for c in core}
@@ -135,18 +145,21 @@ class Host:
             self.mem_room = min(self.mem_cap - self.mem_committed,
                                 self.mem.available_mib - self.mem.margin_mib - self.mem.unrealized_mib)
 
-    def fits(self, h, lease: bool = False) -> bool:
-        return self.shortfall(h, lease) is None
+    def fits(self, h) -> bool:
+        return self.shortfall(h) is None
 
-    def shortfall(self, h, lease: bool = False) -> Optional[str]:
-        """Why `h` does not fit now (None when it does), in words for the status page."""
+    def shortfall(self, h) -> Optional[str]:
+        """Why `h` does not fit now (None when it does), in words for the status page.
+        A pytest lease (the fast lane) counts declarations only and may use the cores
+        kept for it; everything in the queue also backs off from unmanaged load."""
+        fast = getattr(h, "fast", False)
         if self.cpu and cores_of(h):
             room = self.cores_cap - self.cores_committed
-            if not lease:
-                room -= self.unmanaged_over + max(0, self.cpu.lease_reserve - self.lease_cores)
+            if not fast:
+                room -= self.unmanaged_over + max(0, self.cpu.lease_reserve - self.fast_cores)
             if h.cores > room:
                 extra = f", {self.unmanaged_over} busy with unmanaged work" \
-                    if not lease and self.unmanaged_over else ""
+                    if not fast and self.unmanaged_over else ""
                 return f"cores: needs {h.cores}, {max(0, room)} free{extra}"
         if self.mem and h.mem_mib > self.mem_room:
             return f"memory: needs {_gb(h.mem_mib)}, {_gb(max(0, self.mem_room))} free"
@@ -164,8 +177,8 @@ class Host:
     def take(self, h) -> Optional[List[int]]:
         """Commit `h`; the logical CPUs it gets (None when cores are not scheduled)."""
         self.cores_committed += cores_of(h)
-        if isinstance(h, Lease):
-            self.lease_cores += h.cores
+        if getattr(h, "fast", False):
+            self.fast_cores += h.cores
         self.mem_committed += h.mem_mib
         if self.mem:
             self.mem_room -= h.mem_mib
@@ -196,9 +209,10 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     running = [j for j in v.active if j.status == "running"]
     host = Host(v)
 
-    pending = [l for l in v.leases if l.status == "waiting"]
+    # The fast lane: pytest runs, first come first served, ahead of the queue.
+    pending = [l for l in v.leases if l.status == "waiting" and l.fast]
     for lease in list(pending):
-        short = host.shortfall(lease, lease=True)
+        short = host.shortfall(lease)
         if short:
             why[f"lease:{lease.id}"] = short
             continue
@@ -208,15 +222,18 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
         actions.append(("grant_lease", lease.id, host.take(lease) or []))
         pending.remove(lease)
 
+    # The queue: jobs and `ws run` commands together, highest priority first, then first come.
+    queue = queue_order(list(v.queued) + [l for l in v.leases if l.status == "waiting" and not l.fast])
+
     if v.take:
-        why.update({f"job:{j.id}": "operator take: nothing starts until `ws release`" for j in v.queued})
+        why.update({h.key: "operator take: nothing starts until `ws release`" for h in queue})
         actions += [("stop_job", j.id, "requeue") for j in running]
         if v.pair in ("up", "starting"):
             actions.append(("stop_pair",))
         return actions
 
     if v.vram_total_mib is None or v.vram_used_mib is None:
-        why.update({f"job:{j.id}": "the card is unreadable; nothing starts" for j in v.queued})
+        why.update({h.key: "the card is unreadable; nothing starts" for h in queue})
         return actions  # fail closed: start nothing on an unreadable card
 
     cap = v.vram_total_mib - margin_mib
@@ -226,7 +243,7 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     free = v.vram_total_mib - v.vram_used_mib - margin_mib
 
     if preempt_on_interactive and v.demand_pending and v.pair == "down":
-        why.update({f"job:{j.id}": "the interactive pair is coming back first" for j in v.queued})
+        why.update({h.key: "the interactive pair is coming back first" for h in queue})
         for j in sorted(running, key=lambda j: j.started_at or 0, reverse=True):
             if cap - committed >= want_mib:
                 break
@@ -250,7 +267,7 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
             swap_blocked = True
 
     room = cap - committed - pair_mib
-    head = v.queued[0] if v.queued else None
+    head = queue[0] if queue else None
     # On-demand services: start for a waiting caller; stop when idle and either past
     # the idle limit or in the way of a swap or of the head of the queue.
     for sv in v.services:
@@ -272,9 +289,11 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     svc_need = max((sv.vram_mib for sv in v.services
                     if sv.state == "down" and sv.waiting and sv.name not in started), default=0)
 
-    waiting = list(v.queued)
-    for job in v.queued:
-        key = f"job:{job.id}"
+    waiting = list(queue)
+    started_now: List = []
+    shadows: Dict[str, Optional[float]] = {}
+    for job in queue:
+        key = job.key
         if job.vram_mib > min(room, free):
             whose = " (interactive pair up)" if pair_holds else (" (reserve window)" if v.reserved else "")
             why[key] = f"VRAM: needs {_gb(job.vram_mib)}, {_gb(max(0, min(room, free)))} free{whose}"
@@ -285,11 +304,20 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
             continue
         # Whoever is first still waiting is protected, also once the original head starts.
         first = waiting[0]
+        backfill = False
         if job is not first:
             if (job.vram_mib and cap - (committed + job.vram_mib) < first.vram_mib) \
                     or not host.leaves_room_for(job, first):
-                why[key] = f"held back for #{first.id} (first in line)"
-                continue
+                # It may still go ahead if its estimate has it done before the first in
+                # line could start anyway. Only a job: it can be stopped if it runs over.
+                if first.key not in shadows:
+                    shadows[first.key] = project(v, margin_mib, [first], started_now)[first.key][0]
+                shadow = shadows[first.key]
+                if not (isinstance(job, Job) and job.expect_seconds and shadow is not None
+                        and v.now + job.expect_seconds <= shadow):
+                    why[key] = f"held back for {label(first)} (first in line)"
+                    continue
+                backfill = True
         if job.vram_mib and swap_blocked and cap - (committed + job.vram_mib) < want_mib:
             why[key] = "waiting for the LLM model switch"
             continue
@@ -297,11 +325,21 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
             why[key] = "waiting for an on-demand service to start"
             continue
         cpus = host.take(job)
-        actions.append(("start_job", job.id) if cpus is None else ("start_job", job.id, cpus))
+        if isinstance(job, Lease):
+            actions.append(("grant_lease", job.id, cpus or []))
+        elif backfill:
+            actions.append(("start_job", job.id, cpus, "backfill"))
+        else:
+            actions.append(("start_job", job.id) if cpus is None else ("start_job", job.id, cpus))
         waiting.remove(job)
+        started_now.append(job)
         committed += job.vram_mib
         room -= job.vram_mib
         free -= job.vram_mib
+
+    # A job that went ahead on its estimate and has run past it makes way for the first in line.
+    if waiting and not v.take:
+        actions += _overrun_stops(v, waiting[0], host, cap - committed - pair_mib, why)
 
     # Only jobs that need the card keep the pair away or send it off.
     waiting = [j for j in waiting if j.vram_mib > 0]
@@ -325,6 +363,120 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     elif v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
         actions.append(("start_pair", want))
     return actions
+
+
+def queue_order(items):
+    """Highest priority first, then first come."""
+    return sorted(items, key=lambda h: (-h.priority, h.queued_at, h.key))
+
+
+def label(h) -> str:
+    return f"#{h.id}" if isinstance(h, Job) else f"ws run #{h.id}"
+
+
+OVERDUE_GRACE_SECONDS = 600     # a holder past its estimate is assumed to end this much later
+
+
+def expected_end(h, now: float) -> Tuple[Optional[float], bool]:
+    """(When a running job or lease should end, whether it is past its estimate).
+    From its progress once a quarter is done, else from its estimate; None when it
+    gave neither."""
+    start = getattr(h, "started_at", None) or getattr(h, "granted_at", None)
+    if start is None:
+        return None, False
+    est = None
+    chunks, chunk, pct = getattr(h, "chunks", None), getattr(h, "chunk", None), getattr(h, "pct", None)
+    done = (chunk - 1) / chunks if chunks and chunk else (pct / 100 if pct is not None else None)
+    if done is not None and done >= 0.25 and now > start:
+        est = start + (now - start) / done
+    elif h.expect_seconds:
+        est = start + h.expect_seconds
+    if est is None:
+        return None, False
+    if est < now:
+        return now + OVERDUE_GRACE_SECONDS, True
+    return est, False
+
+
+def project(v: View, margin_mib: int, items=None, extra_running=()) -> Dict[str, Tuple]:
+    """When each waiting item should start and end ((start, end); None where unknown),
+    and each running holder end ((None, end)): holders end at their expected end, and
+    the queue starts in order as the declared budget frees up. Measured load, the
+    interactive pair and pytest are left out: it is an estimate, not a promise."""
+    need = lambda h: (cores_of(h) if v.cpu else 0, h.mem_mib if v.mem else 0, h.vram_mib)
+    holders = list(v.active) + [l for l in v.leases if l.status == "granted" and not l.fast]
+    # The room as measured now, plus what holders free as they end: unmanaged work (the
+    # desktop, agents, services) is taken to stay as it is.
+    host = Host(v)
+    held_cores = sum(cores_of(h) for h in holders)
+    held_mem = sum(h.mem_mib for h in holders)
+    budget = [
+        (host.cores_cap - host.unmanaged_over - v.cpu.lease_reserve) if v.cpu else float("inf"),
+        (min(host.mem_cap, host.mem_room + host.mem_committed) - (host.mem_committed - held_mem))
+        if v.mem else float("inf"),
+        (v.vram_total_mib - margin_mib) if v.vram_total_mib else float("inf"),
+    ]
+    del held_cores
+    out: Dict[str, Tuple] = {}
+    ends = []                       # (end, need) of holders that should end
+    free = list(budget)
+    for h in holders:
+        end, over = expected_end(h, v.now)
+        out[h.key] = (None, end, over)
+        free = [f - n for f, n in zip(free, need(h))]
+        if end is not None:
+            ends.append((end, need(h)))
+    for h in extra_running:         # started this tick
+        free = [f - n for f, n in zip(free, need(h))]
+        if h.expect_seconds:
+            ends.append((v.now + h.expect_seconds, need(h)))
+    ends.sort(key=lambda e: e[0])
+    t, blocked = v.now, False
+    queue = queue_order(list(v.queued) + [l for l in v.leases if l.status == "waiting" and not l.fast]) \
+        if items is None else list(items)
+    for h in queue:
+        n = need(h)
+        while not blocked and any(x > f for x, f in zip(n, free)):
+            if not ends:
+                blocked = True      # waits on something with no estimate
+                break
+            end, released = ends.pop(0)
+            t = max(t, end)
+            free = [f + r for f, r in zip(free, released)]
+        if blocked:
+            out[h.key] = (None, None, False)
+            continue
+        end = t + h.expect_seconds if h.expect_seconds else None
+        out[h.key] = (t, end, False)
+        free = [f - x for f, x in zip(free, n)]
+        if end is not None:
+            ends.append((end, n))
+            ends.sort(key=lambda e: e[0])
+    return out
+
+
+def _overrun_stops(v: View, first, host: "Host", vram_room: int, why: Dict[str, str]) -> List[Action]:
+    """Stop jobs that started ahead of `first` on their estimate and have run past it,
+    newest first, if that makes room for `first` in the declared budget."""
+    over = [j for j in v.active if j.status == "running" and j.backfill and j.expect_seconds
+            and j.started_at and v.now > j.started_at + j.expect_seconds]
+    if not over:
+        return []
+    cores = (host.cores_cap - host.cores_committed) if host.cpu else 10 ** 6
+    mem = (host.mem_cap - host.mem_committed) if host.mem else 10 ** 9
+    vram = vram_room + sum(j.vram_mib for j in v.active if j.status == "stopping")
+    fits = lambda: cores_of(first) <= cores and first.mem_mib <= mem and first.vram_mib <= vram
+    if fits():
+        return []
+    stops = []
+    for j in sorted(over, key=lambda j: j.started_at, reverse=True):
+        stops.append(("stop_job", j.id, "requeue"))
+        cores, mem, vram = cores + cores_of(j), mem + j.mem_mib, vram + j.vram_mib
+        if fits():
+            why[first.key] = "stopping " + ", ".join(f"#{a[1]}" for a in stops) + \
+                " (went ahead on its estimate and ran over) to make room"
+            return stops
+    return []
 
 
 def _make_room(v: View, first: Job, room_mib: int) -> List[Action]:

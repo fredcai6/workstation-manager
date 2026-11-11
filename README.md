@@ -18,13 +18,22 @@ state reached 750-900, and pinning to SMT siblings cost 35% (2026-10-15 sweep,
 
 ```
 ws status [--json]                    card, cores, memory, leases, queue
-ws submit --cores 4 --mem 8G [--vram 18G] --name NAME -- CMD...   queue a job
-ws run --cores 4 --mem 8G -- CMD...   run here, in the foreground, once it fits
+ws submit --cores 4 --mem 8G --expect 2h [--vram 18G] [--priority N] --name NAME -- CMD...
+                                      queue a job
+ws run --cores 4 --mem 8G --expect 20m [--priority N] -- CMD...
+                                      wait in the same queue, then run here, in the foreground
 ws queue [--json]                     broker state only
 ws cancel ID
 ws log ID                             path of a job's log
 ws take / ws release                  operator override: stop everything / resume
 ```
+
+`--expect` is how long it should run (2h, 90m, 1h30m; required, or set `WS_EXPECT`,
+which launcher scripts pass through). It is an estimate: it places the work on the
+page's timeline and lets a short job fill a gap ahead of the first in line, and
+nothing is stopped for running over unless it went ahead that way. `ws submit` and
+`ws run` print what earlier runs of the same name took and peaked at. Without
+`--name`, work is named after its folder and script (`cfb-oracle: fit.py`).
 
 `--cores` counts physical cores (default 1); each comes with both of its SMT
 siblings. `--mem` is peak memory and is required: it is enforced (MemoryMax, no
@@ -114,16 +123,19 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   held core.
 - **Room.** `reserve_cores` (2) are never handed out: they are left for the desktop,
   agents, the interactive pair and the broker. `lease_reserve_cores` (2) are kept
-  for leases: batch never takes them. A batch job also counts cores that unmanaged
-  work keeps busy (smoothed over about 30 s) against its room, so it waits rather
-  than piling onto an overloaded box. A lease has a caller waiting and counts
+  for pytest: the queue never takes them. Everything in the queue (jobs and `ws run`)
+  also counts cores that unmanaged work keeps busy (smoothed over about 30 s) against
+  its room, so it waits rather than piling onto an overloaded box. A pytest run counts
   declarations only.
 - **Memory.** A holder starts only when its declaration fits both the budget
   (MemTotal less `mem_margin_mib`, 8 GB) and what is measured: MemAvailable less the
   margin, less memory running holders have declared but not yet used.
-- **Order.** Leases go first, first come first served, even during a take: they hold
-  no VRAM. Then jobs, highest `--priority` first (default 0; `ws priority ID N`
-  changes it), then first come first served. When the first job waiting for the card
+- **Order.** One queue holds jobs and `ws run` commands: highest `--priority` first
+  (default 0; `ws priority ID N` changes a job's), then first come first served.
+  pytest runs are the fast lane: they go first, first come first served, even during
+  a take. A later job may go ahead of the first in line when its `--expect` has it
+  done before that one could start; if it then runs over while the first waits, it is
+  stopped and requeued. When the first job waiting for the card
   cannot fit, running jobs of lower priority are stopped and requeued, newest first,
   until it would (never in a reserve window), so give priority only to work that
   should interrupt others, and only to jobs that resume. A later job may start ahead of the
