@@ -72,18 +72,6 @@ class TestCores(unittest.TestCase):
         self.assertEqual(acts, [])
 
 
-class TestLegacy(unittest.TestCase):
-    def test_legacy_job_ignores_cores_as_before(self):
-        old = dataclasses.replace(cjob(1, mem=0, vram=1500), legacy=True)
-        acts = run(hview(queued=[old], busy=[1.0] * 12))
-        self.assertEqual(acts, [("start_job", 1, [])])
-
-    def test_running_legacy_job_holds_no_cores(self):
-        old = dataclasses.replace(cjob(1, mem=0, status="running", cpus=[]), legacy=True)
-        self.assertEqual(run(hview(queued=[cjob(2, cores=8)], active=[old])),
-                         [("start_job", 2, sorted(c for core in CORES[:8] for c in core))])
-
-
 class TestMemory(unittest.TestCase):
     def test_declared_budget_blocks(self):
         running = cjob(1, mem=40 * GB, status="running", cpus=[0, 12])
@@ -224,8 +212,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestLegacyCommand(unittest.TestCase):
-    def test_ws_submit_needs_mem_and_the_gpu_shim_does_not(self):
+class TestSubmitCommand(unittest.TestCase):
+    def test_ws_submit_needs_mem(self):
         import os, subprocess, sys
         from workstation_manager.config import REPO
         with tempfile.TemporaryDirectory() as d:
@@ -236,11 +224,6 @@ class TestLegacyCommand(unittest.TestCase):
                                env=env, capture_output=True, text=True)
             self.assertEqual(r.returncode, 2)
             self.assertIn("--mem is required", r.stderr)
-            r = subprocess.run([sys.executable, str(REPO / "gpu"), "submit", "--vram", "1G", "--", "true"],
-                               env=env, capture_output=True, text=True)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            j = Store(Path(d) / "state/broker.db").get(1)
-            self.assertEqual((j.legacy, j.mem_mib, j.vram_mib), (True, 0, 1024))
 
 
 class TestWhyWaiting(unittest.TestCase):

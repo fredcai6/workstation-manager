@@ -59,7 +59,7 @@ def start(cfg: Config, job: Job) -> None:
         *([f"--setenv=WORKSTATION_MANAGER_CONFIG={os.environ['WORKSTATION_MANAGER_CONFIG']}"]
           if os.environ.get("WORKSTATION_MANAGER_CONFIG") else []),
         *(["-p", f"MemoryMax={job.mem_mib}M", "-p", "MemorySwapMax=0"]
-          if job.mem_mib and not job.legacy else []),
+          if job.mem_mib else []),
         sys.executable, str(REPO / "ws"), "_wrap", str(job.id),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -126,10 +126,7 @@ def wrap(cfg: Config, job_id: int) -> int:
     env.update(WS_JOB_ID=str(job_id), WS_JOB_LABEL=label(job),
                WS_JOB_VRAM_MIB=str(job.vram_mib), WS_JOB_MEM_MIB=str(job.mem_mib),
                PYTHONUNBUFFERED="1")
-    if job.legacy:
-        env.update(GPU_JOB_ID=str(job_id), GPU_JOB_LABEL=label(job),
-                   GPU_JOB_VRAM_MIB=str(job.vram_mib))
-    elif job.cpus:
+    if job.cpus:
         cpu.pin_process(job.cpus)
         env = cpu.thread_env(env, job.cores, job.cpus)
     oom_kills_before = cpu.own_oom_kills()

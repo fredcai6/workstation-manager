@@ -1,7 +1,0 @@
-#!/usr/bin/env python3
-# Temporary: gpu-manager's command for callers not yet moved to `ws` (worktree
-# scripts that call ~/projects/gpu-manager/gpu). Delete once nothing calls it.
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from workstation_manager.cli import legacy_main
-sys.exit(legacy_main())

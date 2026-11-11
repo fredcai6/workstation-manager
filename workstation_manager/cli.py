@@ -94,11 +94,10 @@ def cmd_submit(args, cfg) -> int:
     argv = _command(args, "submit")
     if not argv:
         return 2
-    legacy = args.mem is None
-    if legacy and not getattr(args, "legacy_ok", False):
+    if args.mem is None:
         print("ws submit: --mem is required (peak memory, e.g. 8G)", file=sys.stderr)
         return 2
-    if _never_fits(cfg, args.cores, args.mem or 0, "submit"):
+    if _never_fits(cfg, args.cores, args.mem, "submit"):
         return 2
     if args.vram:
         from .daemon import pick_card
@@ -116,7 +115,7 @@ def cmd_submit(args, cfg) -> int:
     job_id = store.submit(name, owner, args.vram, argv, os.getcwd(),
                           cfg.default_retries if args.retries is None else args.retries,
                           cfg.default_grace_seconds if args.grace is None else args.grace,
-                          cores=args.cores, mem_mib=args.mem or 0, legacy=legacy,
+                          cores=args.cores, mem_mib=args.mem,
                           priority=args.priority)
     runner.save_env(cfg, job_id, dict(os.environ))
     from .lease import poke
@@ -235,14 +234,7 @@ def cmd_wrap(args, cfg) -> int:
     return runner.wrap(cfg, args.id)
 
 
-def legacy_main(argv=None) -> int:
-    """The `gpu` command: gpu-manager's calls for callers not yet moved to `ws`. A job
-    submitted this way declares no memory and keeps the old names (see Job.legacy)."""
-    argv = list(sys.argv[1:] if argv is None else argv)
-    return main(argv, legacy_ok=bool(argv) and argv[0] == "submit")
-
-
-def main(argv=None, legacy_ok=False) -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ws", description="Workstation manager: queue and leases for the cores, memory and GPU, and the interactive tier.")
     sub = parser.add_subparsers(dest="command")
 
@@ -306,7 +298,6 @@ def main(argv=None, legacy_ok=False) -> int:
     p.set_defaults(fn=cmd_wrap)
 
     args = parser.parse_args(argv)
-    args.legacy_ok = legacy_ok
     if not getattr(args, "fn", None):
         parser.print_help()
         return 1

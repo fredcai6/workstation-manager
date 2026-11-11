@@ -118,8 +118,8 @@ class Job:
     mem_mib: int = 0                # peak memory, enforced as the unit's MemoryMax
     cpus: Optional[List[int]] = None  # logical CPUs it was given when started
     # Submitted under the gpu-manager names (before the rename, or through the `gpu`
-    # shim): keeps the gpu-job-N unit, the old container label and GPU_JOB_* env, and
-    # is neither pinned nor memory-capped. Goes away with the shim.
+    # command, retired 2026-11-11): kept so those rows still read as they ran (gpu-job-N,
+    # VRAM only). No new job is submitted this way.
     legacy: bool = False
     # Higher goes first in the queue, and stops running jobs below it that keep it off the card.
     priority: int = 0
