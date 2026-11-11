@@ -41,7 +41,7 @@ Rules, in order:
 12. Estimates: every job and `ws run` says how long it should run (--expect). A later
    job that does not leave room for the first in line may still start if its estimate
    has it done before the first in line could start (project(): holders end at their
-   estimates, or by their progress once a quarter is done). If it runs past its
+   estimates). If it runs past its
    estimate while the first in line waits, it is stopped and requeued, newest first,
    when that makes room. A `ws run` never goes ahead this way: it cannot be stopped.
    Nothing else is ever stopped for running over.
@@ -378,21 +378,13 @@ OVERDUE_GRACE_SECONDS = 600     # a holder past its estimate is assumed to end t
 
 
 def expected_end(h, now: float) -> Tuple[Optional[float], bool]:
-    """(When a running job or lease should end, whether it is past its estimate).
-    From its progress once a quarter is done, else from its estimate; None when it
-    gave neither."""
+    """(When a running job or lease should end, whether it is past its estimate); None
+    when it gave none. From the estimate alone: chunk progress is no clock, since a job
+    that resumes from saved work jumps straight to a late chunk."""
     start = getattr(h, "started_at", None) or getattr(h, "granted_at", None)
-    if start is None:
+    if start is None or not h.expect_seconds:
         return None, False
-    est = None
-    chunks, chunk, pct = getattr(h, "chunks", None), getattr(h, "chunk", None), getattr(h, "pct", None)
-    done = (chunk - 1) / chunks if chunks and chunk else (pct / 100 if pct is not None else None)
-    if done is not None and done >= 0.25 and now > start:
-        est = start + (now - start) / done
-    elif h.expect_seconds:
-        est = start + h.expect_seconds
-    if est is None:
-        return None, False
+    est = start + h.expect_seconds
     if est < now:
         return now + OVERDUE_GRACE_SECONDS, True
     return est, False

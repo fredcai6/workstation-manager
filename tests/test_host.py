@@ -353,9 +353,11 @@ class TestEstimates(unittest.TestCase):
         self.assertEqual(p["job:3"][:2], (17_800.0, None))
         self.assertEqual(p["job:4"][:2], (None, None))  # behind a job with no estimate
 
-    def test_progress_beats_the_estimate_once_a_quarter_is_done(self):
+    def test_end_comes_from_the_estimate_not_chunk_progress(self):
+        # 11-11: #363 resumed at "chunk 2 of 2" after 9 minutes; it was not half done.
         from workstation_manager.scheduler import expected_end
-        j = dataclasses.replace(self.busy, started_at=6_000.0, chunk=3, chunks=4)  # half done at 4,000s
-        self.assertEqual(expected_end(j, 10_000.0), (14_000.0, False))
+        j = dataclasses.replace(self.busy, started_at=9_500.0, chunk=2, chunks=2)
+        self.assertEqual(expected_end(j, 10_000.0), (13_100.0, False))
+        self.assertEqual(expected_end(dataclasses.replace(j, expect_seconds=None), 10_000.0), (None, False))
         late = dataclasses.replace(self.busy, started_at=1_000.0, chunk=None, chunks=None)
         self.assertEqual(expected_end(late, 10_000.0), (10_600.0, True))
