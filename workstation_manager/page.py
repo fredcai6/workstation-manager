@@ -53,6 +53,11 @@ margin-right:6px;vertical-align:1px;background:var(--ink3)}
 .st.good::before{background:var(--good)}.st.warning::before{background:var(--warning)}
 .st.critical::before{background:var(--critical)}
 .empty{color:var(--ink2);font-size:14px}
+.pri{display:inline-block;min-width:2.2em;text-align:center;padding:0 6px;border-radius:9px;font-size:13px;
+font-variant-numeric:tabular-nums;background:var(--track);color:var(--ink2)}
+.pri.hi{background:var(--s1);color:#fff}.pri.lo{background:transparent;border:1px solid var(--track)}
+tr.band td{border-top:2px solid var(--ink3)}
+.why{font-size:13px;color:var(--ink2)}
 .cores{display:grid;grid-template-columns:repeat(auto-fit,minmax(18px,1fr));gap:3px;margin-top:10px}
 .cores span{display:block;height:22px;border-radius:3px;background:var(--track);position:relative;overflow:hidden}
 .cores span b{position:absolute;left:0;right:0;bottom:0;background:var(--ink3)}
@@ -74,6 +79,13 @@ def _gb(mib) -> str:
 
 def _clock(t) -> str:
     return time.strftime("%a %H:%M", time.localtime(t)) if t else ""
+
+
+def _pri(p) -> str:
+    """A job's priority as a pill: filled above the default, outlined below it."""
+    p = p or 0
+    cls = "hi" if p > 0 else ("lo" if p < 0 else "")
+    return f'<span class="pri {cls}" title="priority {p}">{"+" if p > 0 else ""}{p}</span>'
 
 
 def _job_colour(i: int) -> str:
@@ -187,6 +199,7 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
         body = '<p class="empty">The broker has not run yet.</p>'
     else:
         stale = b["age_seconds"] > 60
+        why = b.get("waiting_on") or {}
         pcls, ptxt = PAIR.get(b["pair"], ("", b["pair"]))
         hold = ""
         if b["pair"] == "up" and s["queued"]:
@@ -208,7 +221,11 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                    f'{_e(h["reserve"])} always left to it</div>{_cores(s)}</div>')
         out.append(f'<div class="tile" style="grid-column:1/-1"><div class="k">Memory</div>'
                    f'<div class="v">{_gb(h["mem_available_mib"])} available of {_gb(h["mem_total_mib"])}</div>'
-                   f'<div class="n">holders shown at what they declared</div>{_memory(s, h)}</div>')
+                   f'<div class="n">holders shown at what they declared'
+                   + (f' · <b>room for new work {_gb(h["mem_room_mib"])}</b> (after the {_gb((b.get("mem") or {}).get("margin_mib") or 0)} margin '
+                      f'and {_gb((b.get("mem") or {}).get("unrealized_mib") or 0)} declared but not yet used)'
+                      if h.get("mem_room_mib") is not None else "")
+                   + f'</div>{_memory(s, h)}</div>')
         out.append(f'<div class="tile"><div class="k">Interactive tier</div>'
                    f'<div class="v"><span class="st {pcls}">{_e(ptxt)}</span></div>'
                    f'<div class="n">{_e(b.get("model") or "")}'
@@ -230,29 +247,39 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                 log = f'<div class="log">last output {_ago(now - j["log_at"])} ago: {_e(j.get("log_last"))}</div>'
             out.append(
                 f'<div class="job"><div class="t"><span class="name">#{j["id"]} {_e(j["name"])}</span>'
-                f'<span class="muted">{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))} · started {_ago(now - (j["started_at"] or now))} ago'
-                f'{" · " + _e(j["owner"]) if j["owner"] else ""}</span></div>'
+                f'<span class="muted">{_pri(j.get("priority"))} · {_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))} · started {_ago(now - (j["started_at"] or now))} ago'
+                f'</span></div>'
                 f'{_progress(j, _job_colour(i))}{log}</div>')
 
         out.append("<h2>Leases (pytest, ws run)</h2>")
         if not s.get("leases"):
             out.append('<p class="empty">None.</p>')
         else:
-            out.append('<table><tr><th>Lease</th><th>Holds</th><th>State</th><th>Owner</th></tr>')
+            out.append('<table><tr><th>Lease</th><th>Holds</th><th>State</th></tr>')
             for l in s["leases"]:
                 when = l["granted_at"] if l["status"] == "granted" else l["requested_at"]
                 state = f'{"held" if l["status"] == "granted" else "waiting"} {_ago(now - when)}'
+                reason = why.get(f"lease:{l['id']}") if l["status"] != "granted" else None
                 out.append(f'<tr><td>#{l["id"]} {_e(l["name"])}</td><td>{_e(describe(l["cores"], l["mem_mib"], 0))}</td>'
-                           f'<td><span class="st {"good" if l["status"] == "granted" else ""}">{state}</span></td>'
-                           f'<td>{_e(l["owner"])}</td></tr>')
+                           f'<td><span class="st {"good" if l["status"] == "granted" else ""}">{state}</span>'
+                           f'{f"<div class=why>{_e(reason)}</div>" if reason else ""}</td></tr>')
             out.append("</table>")
 
         out.append("<h2>Queue</h2>")
         if not s["queued"]:
             out.append('<p class="empty">Empty.</p>')
         else:
-            out.append('<table><tr><th>Job</th><th>Needs</th><th>Waiting</th><th>Notes</th><th>Owner</th></tr>')
+            counts: Dict[int, int] = {}
             for j in s["queued"]:
+                counts[j.get("priority") or 0] = counts.get(j.get("priority") or 0, 0) + 1
+            stack = " · ".join(f"{_pri(p)} {n} waiting" for p, n in sorted(counts.items(), reverse=True))
+            out.append(f'<p class="muted">In the order they start: highest priority first, then first come. '
+                       f'A job that needs the card stops running jobs of lower priority that keep it off. '
+                       f'Leases go ahead of all of them.</p><p class="muted">{stack}</p>')
+            out.append('<table><tr><th class="num">#</th><th>Priority</th><th>Job</th><th>Needs</th>'
+                       '<th>Waiting</th><th>Held up by</th></tr>')
+            prev = None
+            for n, j in enumerate(s["queued"], 1):
                 notes = []
                 if j["interruptions"]:
                     notes.append(f"{j['interruptions']} interruption(s)")
@@ -260,9 +287,16 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                     notes.append(f"{j['failures']} failed attempt(s)")
                 if j.get("chunks"):
                     notes.append(f"last at chunk {j['chunk']} of {j['chunks']}")
-                out.append(f'<tr><td>#{j["id"]} {_e(j["name"])}</td><td>{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))}</td>'
-                           f'<td>{_ago(now - j["submitted_at"])}</td><td>{_e(", ".join(notes))}</td>'
-                           f'<td>{_e(j["owner"])}</td></tr>')
+                pri = j.get("priority") or 0
+                band = ' class="band"' if prev is not None and pri != prev else ""
+                prev = pri
+                reason = why.get(f"job:{j['id']}") or "starting"
+                note = f'<div class="why">{_e(", ".join(notes))}</div>' if notes else ""
+                out.append(f'<tr{band}><td class="num">{n}</td><td>{_pri(pri)}</td>'
+                           f'<td>#{j["id"]} {_e(j["name"])}'
+                           f'{note}</td>'
+                           f'<td>{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))}</td>'
+                           f'<td>{_ago(now - j["submitted_at"])}</td><td class="why">{_e(reason)}</td></tr>')
             out.append("</table>")
 
         out.append("<h2>Finished</h2>")

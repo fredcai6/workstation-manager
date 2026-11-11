@@ -87,9 +87,29 @@ with the run.
   doesn't count as a failure.
 
 The status page shows the card and who holds its VRAM, each core and who holds it
-(or how busy unmanaged work keeps it), memory by holder, the leases, each running
-job's progress and last output line, the queue, finished jobs and the last day of
-events. The broker rewrites it every 30 s into each directory in `page_dirs`.
+(or how busy unmanaged work keeps it), memory by holder and the room left for new
+work, the leases, each running job's priority, progress and last output line, the
+queue in the order it will start (with each job's priority and what is holding it
+up: cores, memory, VRAM, or the job ahead of it), finished jobs and the last day of
+events. `ws status` shows the same. The broker rewrites the page every 30 s into each
+directory in `page_dirs`.
+
+### What gets recorded
+
+`broker.db` in the state dir keeps, besides jobs, leases and events:
+
+- `attempts`: one row per run of a job (each attempt) and per lease, with what it
+  declared (cores, memory, VRAM, priority), its outcome, and what it used: CPU
+  seconds and peak memory, its containers included. A job's end also gets an event
+  such as `used 1.6 of 2 cores, peak 10.2 of 16.0 GB over 2.0h`. Use it to size
+  `--mem` and `--cores`.
+- `samples`: the whole box once a minute (cores held, unmanaged load, memory
+  available, declared and declared-but-unused, VRAM, the pair, queue length) and what
+  held up each waiting job and lease. Kept 180 days.
+
+A unit that ends within 30 s of starting with no exit record (its directory was
+removed, say) counts as a failed attempt, not an interruption, so it is retried
+`--retries` times and then fails. A job whose directory is gone is not started.
 
 ## How cores and memory are shared
 

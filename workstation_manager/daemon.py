@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import socket
@@ -15,6 +16,10 @@ from .config import Config
 from .store import ACTIVE, Store
 
 log = logging.getLogger("workstation-manager")
+# A unit that ends this soon after starting, unasked and with no exit record, never ran.
+QUICK_EXIT_SECONDS = 30
+SAMPLE_SECONDS = 60
+SAMPLE_KEEP_DAYS = 180
 
 
 def pick_card(devices, pci_id):
@@ -33,6 +38,24 @@ def read_card(cfg: Config):
     return d.label, mib(d.vram_total_bytes), mib(d.vram_used_bytes), d.gpu_busy_percent
 
 
+def cpu_cores(job) -> int:
+    return 0 if job.legacy else job.cores
+
+
+def usage_text(usage: dict, cores: int, mem_mib: int) -> str:
+    """e.g. "used 1.6 of 2 cores, peak 10.2 of 16.0 GB, over 2.1h"; "" when nothing was measured."""
+    wall, cpu_s, peak = usage.get("wall_seconds"), usage.get("cpu_seconds"), usage.get("peak_mib")
+    bits = []
+    if cpu_s is not None and wall:
+        bits.append(f"{cpu_s / wall:.1f}" + (f" of {cores} cores" if cores else " cores"))
+    if peak is not None:
+        bits.append(f"peak {peak / 1024:.1f}" + (f" of {mem_mib / 1024:.1f} GB" if mem_mib else " GB"))
+    if not bits:
+        return ""
+    return "used " + ", ".join(bits) + (f" over {wall / 3600:.1f}h" if wall and wall >= 360
+                                        else f" over {wall:.0f}s" if wall else "")
+
+
 class Daemon:
     def __init__(self, cfg: Config, store: Optional[Store] = None, gate: Optional[proxy.Gate] = None):
         self.cfg = cfg
@@ -49,6 +72,8 @@ class Daemon:
         self.meter = cpu.Meter(self.cores)
         self.wake = threading.Event()
         self.cgroups: dict = {}  # unit -> cgroup path
+        self.lease_usage: dict = {}  # lease id -> {"peak_mib", "cpu_seconds"} seen so far
+        self.sample_at = 0.0
         # The hold runs from the owner's last assistant request, across restarts.
         self.gate.last_interactive_at = self.store.get_kv("last_interactive_at", 0.0)
 
@@ -59,7 +84,19 @@ class Daemon:
                 continue
             res = runner.take_result(self.cfg, job.id)
             now = time.time()
-            if res is None:
+            if res is None and job.stop_request is None and job.started_at \
+                    and now - job.started_at < QUICK_EXIT_SECONDS:
+                # Gone within seconds of starting, unasked, with no exit record: the unit
+                # could not run the wrapper at all (its directory is gone, say). Count it
+                # as a failure, so it is retried a few times, not requeued for ever.
+                failed = job.failures >= job.retries
+                self.store.update(job.id, status="failed" if failed else "queued",
+                                  failures=job.failures + 1, stop_request=None,
+                                  **({"ended_at": now} if failed else {}))
+                self.store.event(job.id, f"ended {now - job.started_at:.0f}s after starting with no exit "
+                                         f"record ({runner.unit_result(job)}); "
+                                 + ("failed" if failed else f"retry {job.failures + 1}/{job.retries}"))
+            elif res is None:
                 # Unit gone with no recorded exit: power loss, OOM-killed wrapper, reboot.
                 self.store.update(job.id, status="queued", interruptions=job.interruptions + 1,
                                   stop_request=None)
@@ -93,15 +130,41 @@ class Daemon:
                 self.store.update(job.id, status="failed", ended_at=now,
                                   failures=job.failures + 1, exit_code=res["exit_code"])
                 self.store.event(job.id, f"exit {res['exit_code']}; failed")
+            self._record_attempt(job, res, now)
         for job in self.store.jobs(("queued",)):
             if job.stop_request == "cancel":
                 self.store.update(job.id, status="cancelled", ended_at=time.time(), stop_request=None)
                 self.store.event(job.id, "cancelled while queued")
 
+    def _record_attempt(self, before, res, now) -> None:
+        """One row per attempt, and a line saying what it used against what it declared."""
+        after = self.store.get(before.id)
+        if after.status in ("done", "failed", "cancelled"):
+            outcome = after.status
+        elif after.interruptions > before.interruptions:
+            outcome = "requeued" if before.stop_request == "requeue" else "interrupted"
+        else:
+            outcome = "retry"
+        usage = (res or {}).get("usage") or {}
+        self.store.attempt("job", before.id, outcome, now, usage, name=before.name,
+                           started_at=before.started_at,
+                           exit_code=None if res is None else res.get("exit_code"),
+                           cores=cpu_cores(before), mem_mib=before.mem_mib, vram_mib=before.vram_mib,
+                           priority=before.priority)
+        text = usage_text(usage, cpu_cores(before), before.mem_mib)
+        if text:
+            self.store.event(before.id, text)
+
     def reconcile_leases(self) -> None:
         for lease in self.store.leases():
             if not cpu.alive(lease.pid, lease.pid_start):
                 self.store.end_lease(lease.id)
+                now = time.time()
+                usage = self.lease_usage.pop(lease.id, {})
+                self.store.attempt("lease", lease.id, "ended" if lease.granted_at else "gave up", now,
+                                   usage, name=f"{lease.kind} {lease.name}",
+                                   started_at=lease.granted_at or lease.requested_at,
+                                   cores=lease.cores, mem_mib=lease.mem_mib, vram_mib=0)
         self.store.prune_leases(time.time() - 86400)
 
     def _cgroup(self, unit: str):
@@ -126,8 +189,17 @@ class Daemon:
         for l in leases:
             if l.status != "granted":
                 continue
-            used = cpu.memory_current_mib(self._cgroup(l.unit)) if l.unit else None
-            unrealized += max(0, l.mem_mib - (used if used is not None else cpu.rss_mib(l.pid)))
+            cg = self._cgroup(l.unit) if l.unit else None
+            used = cpu.memory_current_mib(cg) if cg else None
+            if used is None:
+                used = cpu.rss_mib(l.pid)
+            unrealized += max(0, l.mem_mib - used)
+            # What it has used, kept while it runs: its scope is gone once it ends.
+            cpu_s, peak = cpu.cgroup_usage(cg) if cg else (None, None)
+            u = self.lease_usage.setdefault(l.id, {})
+            u["peak_mib"] = max(u.get("peak_mib") or 0, peak or used)
+            if cpu_s is not None:
+                u["cpu_seconds"] = round(cpu_s, 1)
         live = {j.unit for j in active} | {l.unit for l in leases if l.unit}
         self.cgroups = {u: p for u, p in self.cgroups.items() if u in live}
         return (scheduler.CpuView([c.cpus for c in self.cores], list(busy), self.cfg.reserve_cores,
@@ -262,6 +334,10 @@ class Daemon:
                 self.store.grant_lease(act[1], act[2])
             elif kind == "start_job":
                 job = self.store.get(act[1])
+                if not os.path.isdir(job.cwd):
+                    self.store.update(job.id, status="failed", ended_at=time.time())
+                    self.store.event(job.id, f"not started: its directory {job.cwd} is gone")
+                    continue
                 if len(act) > 2:
                     self.store.update(job.id, cpus=act[2])
                     job = self.store.get(job.id)
@@ -323,13 +399,15 @@ class Daemon:
         )
         pair_busy = self.pair_action is not None and self.pair_action.is_alive()
         vram = {m.name: m.vram_mib for m in self.cfg.model_table().values()}
+        why: dict = {}
         actions = scheduler.decide(view, self.cfg.margin_mib, vram,
-                                   self.cfg.hold_minutes, self.cfg.preempt_on_interactive)
+                                   self.cfg.hold_minutes, self.cfg.preempt_on_interactive, why)
         if pair_busy:
             actions = [a for a in actions if a[0] not in ("stop_pair", "start_pair", "swap_model")]
         svc_busy = {n for n, t in self.svc_action.items() if t.is_alive()}
         actions = [a for a in actions if not (a[0] in ("start_service", "stop_service") and a[1] in svc_busy)]
         self.apply(actions)
+        self.record_sample(now, view, why, busy)
         self.store.set_kv("daemon", {"at": time.time(), "pair": self.pair,
                                      "vram_total_mib": total, "vram_used_mib": used,
                                      "busy_pct": busy, "card": card, "in_flight": self.gate.in_flight, "waiting": self.gate.waiting,
@@ -338,6 +416,7 @@ class Daemon:
                                      "waiting_for": dict(self.gate.waiting_for),
                                      "services": {n: self.svc_state[n] for n in self.cfg.services},
                                      "reserved": self.cfg.reserved(now),
+                                     "waiting_on": why,
                                      "cpu": {"cores": [list(c) for c in cpu_view.cores],
                                              "busy": [round(b, 3) for b in cpu_view.busy],
                                              "reserve": cpu_view.reserve,
@@ -346,6 +425,28 @@ class Daemon:
                                              "available_mib": mem_view.available_mib,
                                              "margin_mib": mem_view.margin_mib,
                                              "unrealized_mib": mem_view.unrealized_mib}})
+
+    def record_sample(self, now, view, why, busy) -> None:
+        """The whole box once a minute, so later reviews can see what was binding."""
+        if now - self.sample_at < SAMPLE_SECONDS:
+            return
+        self.sample_at = now
+        held = [l for l in view.leases if l.status == "granted"]
+        holders = list(view.active) + held
+        assigned = {c for h in holders for c in (h.cpus or ())}
+        cores = view.cpu.cores if view.cpu else []
+        unmanaged = sum(b for core, b in zip(cores, view.cpu.busy if view.cpu else [])
+                        if not set(core) & assigned)
+        self.store.sample(
+            now, cores_held=sum(1 for core in cores if set(core) & assigned),
+            unmanaged_busy=round(unmanaged, 2),
+            mem_available_mib=view.mem.available_mib if view.mem else None,
+            mem_declared_mib=sum(h.mem_mib for h in holders),
+            mem_unrealized_mib=view.mem.unrealized_mib if view.mem else None,
+            vram_used_mib=view.vram_used_mib, gpu_busy_pct=busy, pair=view.pair, model=view.loaded,
+            running=len(view.active), queued=len(view.queued), leases_held=len(held),
+            leases_waiting=len(view.leases) - len(held), waiting_on=json.dumps(why) if why else None)
+        self.store.prune_samples(now - SAMPLE_KEEP_DAYS * 86400)
 
     def publish_page(self) -> None:
         if time.time() - self.page_at < self.cfg.page_seconds:

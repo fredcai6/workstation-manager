@@ -71,6 +71,14 @@ class TestWrap(Tmp):
         log = (self.cfg.job_dir(jid) / "log").read_text()
         self.assertIn("chunk 1/3", log)
 
+    def test_result_carries_usage(self):
+        jid = self.submit([sys.executable, "-c", "x = bytearray(50 * 2**20); print('ok')"])
+        with mock.patch.object(runner, "stop_labelled_containers"):
+            runner.wrap(self.cfg, jid)
+        u = runner.take_result(self.cfg, jid)["usage"]
+        self.assertGreaterEqual(u["wall_seconds"], 0)
+        self.assertIn("peak_mib", u)  # None outside a unit with a readable cgroup
+
     def test_oom_line_marks_the_result(self):
         script = "import sys; print('RESOURCE_EXHAUSTED: Out of memory while trying to allocate', flush=True); sys.exit(1)"
         jid = self.submit([sys.executable, "-c", script])
@@ -108,7 +116,7 @@ class TestWrap(Tmp):
 
 class TestReconcile(Tmp):
     def reconcile(self, jid, result, **fields):
-        self.store.update(jid, status="running", started_at=1.0, **fields)
+        self.store.update(jid, **{"status": "running", "started_at": 1.0, **fields})
         d = daemon.Daemon(self.cfg, store=self.store)
         with mock.patch.object(runner, "is_active", return_value=False), \
              mock.patch.object(runner, "take_result", return_value=result):
@@ -133,6 +141,35 @@ class TestReconcile(Tmp):
     def test_lost_unit_is_an_interruption_not_a_failure(self):
         job = self.reconcile(self.submit(["x"]), None)
         self.assertEqual((job.status, job.interruptions, job.failures), ("queued", 1, 0))
+
+    def test_unit_that_never_ran_fails_after_its_retries(self):
+        # 2026-11-08: a job whose directory was deleted restarted 3,044 times, every 5 s.
+        jid = self.submit(["x"], retries=1)
+        with mock.patch.object(runner, "unit_result", return_value="status=200/CHDIR"):
+            for _ in range(2):
+                job = self.reconcile(jid, None, started_at=time.time() - 3)
+        self.assertEqual((job.status, job.failures, job.interruptions), ("failed", 2, 0))
+        self.assertIn("200/CHDIR", self.store.events(0)[-1]["what"])
+
+    def test_job_whose_directory_is_gone_is_not_started(self):
+        jid = self.submit(["x"], cwd=str(self.dir / "gone"))
+        d = daemon.Daemon(self.cfg, store=self.store)
+        with mock.patch.object(runner, "start") as start:
+            d.apply([("start_job", jid)])
+        start.assert_not_called()
+        self.assertEqual(self.store.get(jid).status, "failed")
+
+    def test_each_attempt_is_recorded_with_what_it_used(self):
+        jid = self.submit(["x"], cores=2, mem_mib=16384, retries=1)
+        usage = {"wall_seconds": 7200, "cpu_seconds": 11520, "peak_mib": 10445}
+        self.reconcile(jid, {"exit_code": 1, "usage": usage})
+        self.reconcile(jid, {"exit_code": 0, "usage": usage})
+        rows = self.store.attempts("job", jid)
+        self.assertEqual([r["outcome"] for r in rows], ["retry", "done"])
+        self.assertEqual((rows[1]["peak_mib"], rows[1]["cpu_seconds"], rows[1]["mem_mib"]),
+                         (10445, 11520, 16384))
+        self.assertEqual(self.store.events(0)[-1]["what"],
+                         "used 1.6 of 2 cores, peak 10.2 of 16.0 GB over 2.0h")
 
     def test_requeue_keeps_place_in_line(self):
         first = self.submit(["x"])
@@ -332,3 +369,19 @@ class TestQueueOrder(unittest.TestCase):
             c = st.submit("c", None, 0, ["x"], "/", 0, 60, now=3.0, mem_mib=1)
             st.update(c, priority=10)
             self.assertEqual([j.id for j in st.jobs(("queued",))], [b, c, a])
+
+
+class TestUnitCgroup(unittest.TestCase):
+    def test_bare_name_finds_a_ws_run_scope(self):
+        # `ws run` leases record "ws-run-N"; the unit is ws-run-N.scope. Reading it as a
+        # service found no cgroup, so the lease's memory read as its wrapper's 20 MB.
+        from workstation_manager import cpu
+        seen = []
+
+        def show(cmd, **kw):
+            seen.append(cmd[-1])
+            out = "/app.slice/ws-run-7.scope" if cmd[-1] == "ws-run-7.scope" else ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=out + "\n", stderr="")
+        with mock.patch.object(cpu.subprocess, "run", side_effect=show):
+            self.assertEqual(cpu.unit_cgroup("ws-run-7"), Path("/sys/fs/cgroup/app.slice/ws-run-7.scope"))
+        self.assertEqual(seen, ["ws-run-7.service", "ws-run-7.scope"])

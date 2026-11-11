@@ -30,7 +30,9 @@ class TestLive(unittest.TestCase):
         self.conf = d / "config.toml"
         self.conf.write_text(f'state_dir = "{d / "state"}"\npage_dirs = []\nmem_margin_mib = 1024\n')
         self.env = dict(os.environ, WORKSTATION_MANAGER_CONFIG=str(self.conf))
-        for k in ("WS_JOB_ID", "WS_LEASE"):
+        # The pytest lease this suite runs under sets the thread counts for its own core.
+        for k in ("WS_JOB_ID", "WS_LEASE", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                  "MKL_NUM_THREADS"):
             self.env.pop(k, None)
         self.cfg = config.load(self.conf)
         self.patches = [mock.patch.dict(os.environ, WORKSTATION_MANAGER_CONFIG=str(self.conf)),

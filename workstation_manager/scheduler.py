@@ -109,6 +109,10 @@ def cores_of(h) -> int:
     return 0 if getattr(h, "legacy", False) else h.cores
 
 
+def _gb(mib: float) -> str:
+    return f"{mib / 1024:.1f} GB"
+
+
 class Host:
     """Room on the cores and in memory, updated as the decision hands it out."""
 
@@ -132,13 +136,21 @@ class Host:
                                 self.mem.available_mib - self.mem.margin_mib - self.mem.unrealized_mib)
 
     def fits(self, h, lease: bool = False) -> bool:
+        return self.shortfall(h, lease) is None
+
+    def shortfall(self, h, lease: bool = False) -> Optional[str]:
+        """Why `h` does not fit now (None when it does), in words for the status page."""
         if self.cpu and cores_of(h):
             room = self.cores_cap - self.cores_committed
             if not lease:
                 room -= self.unmanaged_over + max(0, self.cpu.lease_reserve - self.lease_cores)
             if h.cores > room:
-                return False
-        return not self.mem or h.mem_mib <= self.mem_room
+                extra = f", {self.unmanaged_over} busy with unmanaged work" \
+                    if not lease and self.unmanaged_over else ""
+                return f"cores: needs {h.cores}, {max(0, room)} free{extra}"
+        if self.mem and h.mem_mib > self.mem_room:
+            return f"memory: needs {_gb(h.mem_mib)}, {_gb(max(0, self.mem_room))} free"
+        return None
 
     def leaves_room_for(self, h, head) -> bool:
         """Whether starting `h` still lets `head` fit once running work is gone."""
@@ -169,8 +181,11 @@ class Host:
 
 
 def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minutes: float,
-           preempt_on_interactive: bool) -> List[Action]:
-    """`vram` is the pair's footprint per model (or one number for a single model)."""
+           preempt_on_interactive: bool, why: Optional[Dict[str, str]] = None) -> List[Action]:
+    """`vram` is the pair's footprint per model (or one number for a single model).
+    `why`, when given, is filled with what keeps each waiting job and lease from
+    starting ("job:N" / "lease:N" -> reason). It changes no decision."""
+    why = {} if why is None else why
     if isinstance(vram, int):
         vram = {"default": vram}
     want = v.want or next(iter(vram))
@@ -183,20 +198,25 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
 
     pending = [l for l in v.leases if l.status == "waiting"]
     for lease in list(pending):
-        if not host.fits(lease, lease=True):
+        short = host.shortfall(lease, lease=True)
+        if short:
+            why[f"lease:{lease.id}"] = short
             continue
         if lease is not pending[0] and not host.leaves_room_for(lease, pending[0]):
+            why[f"lease:{lease.id}"] = f"held back for lease #{pending[0].id} (first in line)"
             continue
         actions.append(("grant_lease", lease.id, host.take(lease) or []))
         pending.remove(lease)
 
     if v.take:
+        why.update({f"job:{j.id}": "operator take: nothing starts until `ws release`" for j in v.queued})
         actions += [("stop_job", j.id, "requeue") for j in running]
         if v.pair in ("up", "starting"):
             actions.append(("stop_pair",))
         return actions
 
     if v.vram_total_mib is None or v.vram_used_mib is None:
+        why.update({f"job:{j.id}": "the card is unreadable; nothing starts" for j in v.queued})
         return actions  # fail closed: start nothing on an unreadable card
 
     cap = v.vram_total_mib - margin_mib
@@ -206,6 +226,7 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     free = v.vram_total_mib - v.vram_used_mib - margin_mib
 
     if preempt_on_interactive and v.demand_pending and v.pair == "down":
+        why.update({f"job:{j.id}": "the interactive pair is coming back first" for j in v.queued})
         for j in sorted(running, key=lambda j: j.started_at or 0, reverse=True):
             if cap - committed >= want_mib:
                 break
@@ -253,18 +274,27 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
 
     waiting = list(v.queued)
     for job in v.queued:
-        if job.vram_mib > min(room, free) or not host.fits(job):
+        key = f"job:{job.id}"
+        if job.vram_mib > min(room, free):
+            whose = " (interactive pair up)" if pair_holds else (" (reserve window)" if v.reserved else "")
+            why[key] = f"VRAM: needs {_gb(job.vram_mib)}, {_gb(max(0, min(room, free)))} free{whose}"
+            continue
+        short = host.shortfall(job)
+        if short:
+            why[key] = short
             continue
         # Whoever is first still waiting is protected, also once the original head starts.
         first = waiting[0]
         if job is not first:
-            if job.vram_mib and cap - (committed + job.vram_mib) < first.vram_mib:
-                continue
-            if not host.leaves_room_for(job, first):
+            if (job.vram_mib and cap - (committed + job.vram_mib) < first.vram_mib) \
+                    or not host.leaves_room_for(job, first):
+                why[key] = f"held back for #{first.id} (first in line)"
                 continue
         if job.vram_mib and swap_blocked and cap - (committed + job.vram_mib) < want_mib:
+            why[key] = "waiting for the LLM model switch"
             continue
         if job.vram_mib and svc_need and cap - (committed + job.vram_mib) - pair_mib < svc_need:
+            why[key] = "waiting for an on-demand service to start"
             continue
         cpus = host.take(job)
         actions.append(("start_job", job.id) if cpus is None else ("start_job", job.id, cpus))
@@ -276,7 +306,11 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     # Only jobs that need the card keep the pair away or send it off.
     waiting = [j for j in waiting if j.vram_mib > 0]
     if waiting and not v.reserved:
-        actions += _make_room(v, waiting[0], cap - committed - pair_mib)
+        made = _make_room(v, waiting[0], cap - committed - pair_mib)
+        if made:
+            why[f"job:{waiting[0].id}"] = "stopping lower-priority " + \
+                ", ".join(f"#{a[1]}" for a in made) + " to make room"
+        actions += made
     if v.reserved:
         if v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
             actions.append(("start_pair", want))
@@ -286,6 +320,8 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
         if v.pair == "up" and not swap_blocked and first.vram_mib <= cap - committed \
                 and idle_min >= hold_minutes and ("swap_model", want) not in actions:
             actions.append(("stop_pair",))
+        elif v.pair == "up" and idle_min < hold_minutes and f"job:{first.id}" in why:
+            why[f"job:{first.id}"] += f"; the pair is held for {hold_minutes - idle_min:.0f} more min"
     elif v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
         actions.append(("start_pair", want))
     return actions
