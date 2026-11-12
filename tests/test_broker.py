@@ -451,6 +451,47 @@ class TestLearnedEstimates(Tmp):
         self.assertTrue(estimate(s, "job:3", 900.0, 7200).startswith("expected 10m (learned"))
 
 
+class TestLeaseRecord(Tmp):
+    def test_a_lease_its_command_ended_is_recorded_with_its_usage(self):
+        # 11-12: a `ws run` that finished normally marked its own lease done, and the
+        # broker never recorded it: no peaks or CPU time for any `ws run`.
+        import os as _os
+        from workstation_manager import cpu
+        lid = self.store.request_lease("run", "spike: x.py", "t", _os.getpid(), None, 1, 2048, "/s",
+                                       now=10.0, expect_seconds=600)
+        self.store.grant_lease(lid, [0], now=100.0)
+        d = daemon.Daemon(self.cfg, store=self.store)
+        with mock.patch.object(cpu, "alive", return_value=True):
+            d.reconcile_leases()                      # seen while granted
+        d.lease_usage[lid] = {"peak_mib": 900, "cpu_seconds": 250.0}
+        self.store.end_lease(lid, now=400.0)          # the command ends it itself
+        d.reconcile_leases()
+        rows = self.store.attempts("lease", lid)
+        self.assertEqual([(r["name"], r["outcome"], r["ended_at"], r["peak_mib"]) for r in rows],
+                         [("spike: x.py", "ended", 400.0, 900)])
+        d.reconcile_leases()                          # once only
+        self.assertEqual(len(self.store.attempts("lease", lid)), 1)
+
+
+class TestMemoryCharge(unittest.TestCase):
+    def test_charge_is_the_learned_peak_at_most_the_declaration(self):
+        from workstation_manager import estimates as E
+        runs = [E.MemRun(f"fit-{i}", "/w", 16384, 6000 + 300 * (i % 4)) for i in range(20)]
+        m = E.fit_memory(runs)
+        c = E.memory_charge(m, "fit-99", "/w", 16384)
+        self.assertGreater(c, 6600)                   # above all but the top few peaks
+        self.assertLess(c, 16384)                     # well under the declaration
+        new = E.memory_charge(m, "other", "/elsewhere", 16384)
+        self.assertGreater(new, c)                    # nothing known: charged nearer its declaration
+        self.assertLessEqual(new, 16384)
+        self.assertIsNone(E.memory_charge(E.fit_memory(runs[:3]), "fit-1", "/w", 16384))
+
+    def test_killed_at_the_declaration_counts_as_at_least_that(self):
+        from workstation_manager import estimates as E
+        runs = [E.MemRun(f"big-{i}", "/w", 4096, 4096 if i % 2 else 5000) for i in range(10)]
+        self.assertEqual(E.memory_charge(E.fit_memory(runs), "big-x", "/w", 4096), 4096)
+
+
 class TestThreads(Tmp):
     def test_job_is_told_its_threads(self):
         from workstation_manager.cpu import thread_env
