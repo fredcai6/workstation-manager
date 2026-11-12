@@ -39,15 +39,19 @@ Rules, in order:
    of lower priority are stopped and requeued, newest first, until it would, if
    stopping them is enough, and no more than it needs.
    Jobs that are already stopping count as gone. Not during a reserve window.
-12. Estimates: every job and `ws run` says how long it should run (--expect); where
-   earlier runs of the same name finished, the daemon passes the longest of the last
-   few instead, since hand estimates run about 3x long. A later
+12. Estimates: every job and `ws run` says how long it should run (--expect); the daemon
+   passes the learned upper (P80) run time instead (estimates.py: the guess corrected by
+   the record, by where and what the run is and how loaded the box is). A later
    job that does not leave room for the first in line may still start if its estimate
    has it done before the first in line could start (project(): holders end at their
    estimates). If it runs past its
    estimate while the first in line waits, it is stopped and requeued, newest first,
    when that makes room. A `ws run` never goes ahead this way: it cannot be stopped.
    Nothing else is ever stopped for running over.
+13. Small lane: `small_lane` cores are kept for small work (at most that many cores,
+   planned to end within `small_seconds`). Small work fills them first, then the rest;
+   other work never takes them. Small work that fits in the lane may start ahead of a
+   bigger first in line, since it takes nothing that one could use.
 """
 
 from __future__ import annotations
@@ -73,6 +77,8 @@ class CpuView:
     busy: Sequence[float]
     reserve: int = 2
     lease_reserve: int = 0          # cores batch never takes, so a pytest need not wait for it
+    small_lane: int = 0             # cores only small work may take (it may use the rest too)
+    small_seconds: float = 0.0      # small: planned to end within this, on <= small_lane cores
 
 
 @dataclasses.dataclass
@@ -121,6 +127,13 @@ def cores_of(h) -> int:
     return 0 if getattr(h, "legacy", False) else h.cores
 
 
+def is_small(h, cpu: Optional[CpuView]) -> bool:
+    """Small work moves along on the small lane: few cores, planned to end soon."""
+    return bool(cpu and cpu.small_lane and not getattr(h, "fast", False)
+                and 0 < cores_of(h) <= cpu.small_lane
+                and getattr(h, "expect_seconds", None) and h.expect_seconds <= cpu.small_seconds)
+
+
 def _gb(mib: float) -> str:
     return f"{mib / 1024:.1f} GB"
 
@@ -135,6 +148,8 @@ class Host:
         self.cores_committed = sum(cores_of(h) for h in holders)
         # Cores held by pytest runs, the fast lane `lease_reserve` is kept for.
         self.fast_cores = sum(l.cores for l in granted if l.fast)
+        # Cores held by small work: it fills the small lane first, then the rest.
+        self.small_cores = sum(cores_of(h) for h in holders if is_small(h, v.cpu))
         self.mem_committed = sum(h.mem_mib for h in holders)
         if self.cpu:
             where = {c: i for i, core in enumerate(self.cpu.cores) for c in core}
@@ -161,8 +176,14 @@ class Host:
         and leaves the `reserve` and any `lease_reserve` cores alone."""
         if getattr(h, "fast", False):
             return len(self.cpu.cores) - self.cores_committed
-        return (self.cores_cap - self.cores_committed - self.unmanaged_over
+        room = (self.cores_cap - self.cores_committed - self.unmanaged_over
                 - max(0, self.cpu.lease_reserve - self.fast_cores))
+        if not is_small(h, self.cpu):       # the small lane's free cores are not for it
+            room -= self.lane_free()
+        return room
+
+    def lane_free(self) -> int:
+        return max(0, self.cpu.small_lane - self.small_cores) if self.cpu else 0
 
     def shortfall(self, h) -> Optional[str]:
         """Why `h` does not fit now (None when it does), in words for the status page.
@@ -180,8 +201,11 @@ class Host:
         return None
 
     def leaves_room_for(self, h, head) -> bool:
-        """Whether starting `h` still lets `head` fit once running work is gone."""
-        if self.cpu and cores_of(h) and \
+        """Whether starting `h` still lets `head` fit once running work is gone. Small
+        work that fits in the small lane takes nothing a bigger `head` could use."""
+        lane_only = self.cpu and is_small(h, self.cpu) and not is_small(head, self.cpu) \
+            and cores_of(h) <= self.lane_free()
+        if self.cpu and cores_of(h) and not lane_only and \
                 self.cores_cap - (self.cores_committed + cores_of(h)) < cores_of(head):
             return False
         if self.mem and h.mem_mib and self.mem_cap - (self.mem_committed + h.mem_mib) < head.mem_mib:
@@ -191,6 +215,8 @@ class Host:
     def take(self, h) -> Optional[List[int]]:
         """Commit `h`; the logical CPUs it gets (None when cores are not scheduled)."""
         self.cores_committed += cores_of(h)
+        if is_small(h, self.cpu):
+            self.small_cores += cores_of(h)
         if getattr(h, "fast", False):
             self.fast_cores += h.cores
         self.mem_committed += h.mem_mib
@@ -427,40 +453,55 @@ def project(v: View, margin_mib: int, items=None, extra_running=()) -> Dict[str,
     ]
     del held_cores
     out: Dict[str, Tuple] = {}
-    ends = []                       # (end, need) of holders that should end
-    free = list(budget)
+    lane = v.cpu.small_lane if v.cpu else 0
+    sm = lambda h: cores_of(h) if v.cpu and is_small(h, v.cpu) else 0
+    INF = float("inf")
+    # Everything placed on the timeline: (start, end, need, small-lane cores). A holder
+    # with no estimate holds its room for good.
+    placed = []
     for h in holders:
         end, over = expected_end(h, v.now)
         out[h.key] = (None, end, over)
-        free = [f - n for f, n in zip(free, need(h))]
-        if end is not None:
-            ends.append((end, need(h)))
+        placed.append((v.now, end if end is not None else INF, need(h), sm(h)))
     for h in extra_running:         # started this tick
-        free = [f - n for f, n in zip(free, need(h))]
-        if h.expect_seconds:
-            ends.append((v.now + h.expect_seconds, need(h)))
-    ends.sort(key=lambda e: e[0])
-    t, blocked = v.now, False
+        placed.append((v.now, v.now + h.expect_seconds if h.expect_seconds else INF, need(h), sm(h)))
+
+    def fits_at(t: float, dur: float, n, small_h: int) -> bool:
+        """Whether `n` fits from t for dur beside what is placed (checked wherever use rises)."""
+        for tau in [t] + [a for a, _, _, _ in placed if t < a < t + dur]:
+            use = [0.0, 0.0, 0.0]
+            small = 0
+            for a, b, nn, ss in placed:
+                if a <= tau < b:
+                    use = [u + x for u, x in zip(use, nn)]
+                    small += ss
+            room = list(budget)
+            if not small_h:             # other work leaves the small lane's free cores alone
+                room[0] -= max(0, lane - small)
+            if any(x > r - u for x, r, u in zip(n, room, use)):
+                return False
+        return True
+
+    floor = v.now                   # bigger work starts in queue order; small work need not
     queue = queue_order(list(v.queued) + [l for l in v.leases if l.status == "waiting" and not l.fast]) \
         if items is None else list(items)
     for h in queue:
-        n = need(h)
-        while not blocked and any(x > f for x, f in zip(n, free)):
-            if not ends:
-                blocked = True      # waits on something with no estimate
+        n, small_h = need(h), sm(h)
+        dur = h.expect_seconds or INF
+        start = None
+        for t in sorted({floor if not small_h else v.now} |
+                        {b for _, b, _, _ in placed if b != INF and b > (v.now if small_h else floor)}):
+            if fits_at(t, dur, n, small_h):
+                start = t
                 break
-            end, released = ends.pop(0)
-            t = max(t, end)
-            free = [f + r for f, r in zip(free, released)]
-        if blocked:
+        if start is None:           # waits on something with no estimate
             out[h.key] = (None, None, False)
             continue
-        end = t + h.expect_seconds if h.expect_seconds else None
-        out[h.key] = (t, end, False)
-        free = [f - x for f, x in zip(free, n)]
-        if end is not None:
-            ends.append((end, n))
-            ends.sort(key=lambda e: e[0])
+        end = start + h.expect_seconds if h.expect_seconds else None
+        out[h.key] = (start, end, False)
+        placed.append((start, end if end is not None else INF, n, small_h))
+        if not small_h:
+            floor = start
     return out
 
 

@@ -270,25 +270,6 @@ class Store:
                 fields[k] = v
         self.update(job_id, **fields)
 
-    def past_seconds(self, last: int = 5) -> Dict[str, float]:
-        """How long finished runs of each name took, end to end: the longest of the last
-        `last`. A job's attempts are summed (a resumed run is one run); a `ws run` counts
-        from its grant to its end."""
-        rows = self.db.execute(
-            "SELECT j.name AS name, j.ended_at AS ended,"
-            " COALESCE((SELECT SUM(a.ended_at - a.started_at) FROM attempts a WHERE a.kind='job'"
-            "  AND a.ref=j.id AND a.started_at IS NOT NULL), j.ended_at - j.started_at) AS took"
-            " FROM jobs j WHERE j.status='done' AND j.started_at IS NOT NULL"
-            " UNION ALL SELECT name, ended_at, ended_at - granted_at FROM leases"
-            " WHERE kind='run' AND status='done' AND granted_at IS NOT NULL"
-            " ORDER BY ended DESC").fetchall()
-        seen: Dict[str, List[float]] = {}
-        for r in rows:
-            took = seen.setdefault(r["name"], [])
-            if len(took) < last and r["took"] and r["took"] > 0:
-                took.append(r["took"])
-        return {name: max(took) for name, took in seen.items() if took}
-
     # -- leases: foreground work (pytest, `ws run`) holding cores while it runs --
     def request_lease(self, kind, name, owner, pid, pid_start, cores, mem_mib, cwd,
                       unit=None, now=None, priority=0, expect_seconds=None) -> int:

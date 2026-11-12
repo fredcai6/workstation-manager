@@ -387,10 +387,10 @@ class TestUnitCgroup(unittest.TestCase):
         self.assertEqual(seen, ["ws-run-7.service", "ws-run-7.scope"])
 
 
-class TestPastEstimates(Tmp):
-    def done_job(self, name, attempts, ended):
-        jid = self.store.submit(name=name, owner="t", vram_mib=0, argv=["x"], cwd="/", retries=2,
-                                grace_seconds=3, expect_seconds=7200)
+class TestLearnedEstimates(Tmp):
+    def done_job(self, name, attempts, ended, expect=7200, argv=("/x/run.sh",)):
+        jid = self.store.submit(name=name, owner="t", vram_mib=0, argv=list(argv), cwd="/w", retries=2,
+                                grace_seconds=3, expect_seconds=expect)
         t = ended - sum(attempts)
         for i, took in enumerate(attempts):
             last = i == len(attempts) - 1
@@ -399,32 +399,56 @@ class TestPastEstimates(Tmp):
         self.store.update(jid, status="done", started_at=ended - attempts[-1], ended_at=ended)
         return jid
 
-    def test_longest_of_the_last_runs_with_attempts_summed(self):
-        self.done_job("fit", [600], 1000.0)
-        self.done_job("fit", [300, 400], 2000.0)      # requeued once: 700 s in all
-        for i in range(5):
-            self.done_job("fit", [100], 3000.0 + i)    # the five newest push the others out
-        self.done_job("other", [50], 1500.0)
-        self.assertEqual(self.store.past_seconds(), {"fit": 100.0, "other": 50.0})
-        self.assertEqual(self.store.past_seconds(last=7)["fit"], 700.0)
-
-    def test_ws_run_counts_from_grant_and_pytest_and_give_ups_do_not(self):
-        lid = self.store.request_lease("run", "spike: x.py", "t", 1, None, 1, 1024, "/", now=10.0)
+    def test_runs_sum_attempts_and_skip_give_ups_and_pytest(self):
+        from workstation_manager.estimates import runs_from
+        self.done_job("fit", [300, 400], 2000.0)            # requeued once: one 700 s run
+        lid = self.store.request_lease("run", "spike: x.py", "t", 1, None, 1, 1024, "/s", now=10.0,
+                                       expect_seconds=600)
         self.store.grant_lease(lid, [0], now=100.0)
         self.store.end_lease(lid, now=400.0)
-        gave_up = self.store.request_lease("run", "never", "t", 1, None, 1, 1024, "/", now=10.0)
+        gave_up = self.store.request_lease("run", "never", "t", 1, None, 1, 1024, "/", now=10.0,
+                                           expect_seconds=600)
         self.store.end_lease(gave_up, now=900.0)
         py = self.store.request_lease("pytest", "tests", "t", 1, None, 1, 1024, "/", now=10.0)
         self.store.grant_lease(py, [0], now=20.0)
         self.store.end_lease(py, now=80.0)
-        self.assertEqual(self.store.past_seconds(), {"spike: x.py": 300.0})
+        got = {(r.name, r.where, r.expect, r.took) for r in runs_from(self.store.db)}
+        self.assertEqual(got, {("fit", "/x", 7200, 700.0), ("spike: x.py", "/s", 600, 300.0)})
+
+    def test_model_learns_guesses_run_long_and_by_where(self):
+        from workstation_manager import estimates as E
+        runs = [E.Run(f"a-{i}", "/fast", 3600, 600 * (1 + 0.1 * (i % 3))) for i in range(12)] \
+            + [E.Run(f"b-{i}", "/slow", 3600, 3000 * (1 + 0.1 * (i % 3))) for i in range(12)]
+        m = E.fit(runs)
+        fast, slow = E.predict(m, "a-99", "/fast", 3600, None), E.predict(m, "b-99", "/slow", 3600, None)
+        self.assertLess(fast[0], 1000)
+        self.assertGreater(slow[0], 2000)
+        self.assertGreater(fast[1], fast[0])             # P80 above the typical time
+        self.assertIsNone(E.predict(E.fit(runs[:3]), "a", "/fast", 3600, None))   # too few runs
+        self.assertIsNone(E.predict(m, "a", "/fast", None, None))                  # no guess
+
+    def test_busier_box_runs_slower(self):
+        from workstation_manager import estimates as E
+        runs = [E.Run(f"r-{i}", "/w", 1200, 600 * (1 + 0.08 * load), load)
+                for i, load in enumerate([2, 4, 6, 8, 10, 11] * 4)]
+        m = E.fit(runs)
+        self.assertGreater(m.beta, 0.03)
+        self.assertGreater(E.predict(m, "r-x", "/w", 1200, 11)[0], E.predict(m, "r-x", "/w", 1200, 2)[0])
+
+    def test_stems(self):
+        from workstation_manager.estimates import stem, where_of
+        self.assertEqual(stem("generator-anatomy-3"), "generator-anatomy")
+        self.assertEqual(stem("e0-2024a"), "e0")
+        self.assertEqual(stem("cfb-csta-weekly-new"), "cfb-csta-weekly-new")
+        self.assertEqual(where_of(["/mnt/data/x/run.sh", "a"], "/home"), "/mnt/data/x")
+        self.assertEqual(where_of(["./run.sh"], "/home/w"), "/home/w")
 
     def test_status_shows_the_estimate_in_use(self):
         from workstation_manager.board import estimate, expect_of
-        s = {"at": 1000.0, "broker": {"estimates": {"job:3": 600}}}
-        self.assertEqual(expect_of(s, "job:3", 7200), (600, " (past runs; --expect 2.0h)"))
+        s = {"at": 1000.0, "broker": {"estimates": {"job:3": [300, 600]}}}
+        self.assertEqual(expect_of(s, "job:3", 7200), (600, " (learned: typically 5m; --expect 2.0h)"))
         self.assertEqual(expect_of(s, "job:4", 7200), (7200, ""))
-        self.assertTrue(estimate(s, "job:3", 900.0, 7200).startswith("expected 10m (past runs"))
+        self.assertTrue(estimate(s, "job:3", 900.0, 7200).startswith("expected 10m (learned"))
 
 
 class TestThreads(Tmp):

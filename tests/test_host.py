@@ -27,12 +27,12 @@ def lease(id, cores=1, mem=2 * GB, status="waiting", cpus=None):
 
 
 def hview(queued=(), active=(), leases=(), busy=None, avail=50 * GB, unrealized=0,
-          pair="up", used=None, reserve=2, lease_reserve=0, **kw):
+          pair="up", used=None, reserve=2, lease_reserve=0, lane=0, small_s=0.0, **kw):
     if used is None:
         used = (12000 if pair == "up" else 0) + sum(j.vram_mib for j in active)
     return View(now=10_000.0, queued=list(queued), active=list(active), pair=pair,
                 last_interactive_at=10_000.0, vram_total_mib=TOTAL, vram_used_mib=used,
-                cpu=CpuView(CORES, busy or [0.0] * 12, reserve, lease_reserve),
+                cpu=CpuView(CORES, busy or [0.0] * 12, reserve, lease_reserve, lane, small_s),
                 mem=MemView(60 * GB, avail, 8 * GB, unrealized), leases=list(leases), **kw)
 
 
@@ -88,6 +88,50 @@ class TestMemory(unittest.TestCase):
         # The declared budget still binds: 40 GB declared leaves 12 of the 52 GB budget.
         running = cjob(9, mem=40 * GB, status="running", cpus=[0, 12])
         self.assertEqual(run(hview(queued=[cjob(1, mem=18 * GB)], active=[running], avail=30 * GB)), [])
+
+
+def timed(id, cores=1, expect=600, **kw):
+    return dataclasses.replace(cjob(id, cores=cores, **kw), expect_seconds=expect)
+
+
+class TestSmallLane(unittest.TestCase):
+    LANE = dict(reserve=1, lane=2, small_s=1800)
+
+    def test_big_work_leaves_the_lane(self):
+        acts = run(hview(queued=[timed(1, cores=10, expect=7200)], **self.LANE))
+        self.assertEqual(acts, [])                         # 11 for the queue, 2 of them the lane
+        acts = run(hview(queued=[timed(1, cores=9, expect=7200)], **self.LANE))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 1)])
+
+    def test_small_work_moves_along_behind_a_waiting_big_job(self):
+        held = timed(8, cores=9, expect=7200, status="running", cpus=[])
+        big = timed(1, cores=4, expect=7200)
+        acts = run(hview(queued=[big, timed(2), timed(3, cores=2), timed(4)], active=[held], **self.LANE))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 2), ("start_job", 4)])  # 2-core #3 can't
+        acts = run(hview(queued=[big, timed(3, cores=2)], active=[held], **self.LANE))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 3)])
+        # Long or wide work is not small: it waits behind the first in line.
+        acts = run(hview(queued=[big, timed(5, expect=3600)], active=[held], **self.LANE))
+        self.assertEqual(acts, [])
+        acts = run(hview(queued=[big, timed(6, cores=3)], active=[held], **self.LANE))
+        self.assertEqual(acts, [])
+
+    def test_small_work_fills_the_lane_then_the_rest(self):
+        smalls = [timed(i, status="running", cpus=[]) for i in (8, 9)]
+        acts = run(hview(queued=[timed(1, cores=9, expect=7200)], active=smalls, **self.LANE))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 1)])   # lane full: 9 left
+        acts = run(hview(queued=[timed(1)], active=smalls + [timed(7, cores=9, expect=7200,
+                         status="running", cpus=[])], **self.LANE))
+        self.assertEqual(acts, [])                          # 11 held
+
+    def test_projection_keeps_big_work_off_the_lane(self):
+        from workstation_manager.scheduler import project
+        held = timed(8, cores=9, expect=3600, status="running", cpus=[])
+        held = dataclasses.replace(held, started_at=10_000.0)
+        a, b = timed(1, cores=2, expect=7200), timed(2, cores=2)
+        p = project(hview(queued=[a, b], active=[held], **self.LANE), MARGIN)
+        self.assertEqual(p["job:1"][0], 13_600.0)           # big: waits for #8
+        self.assertEqual(p["job:2"][0], 10_000.0)           # small: the lane, now
 
 
 class TestCpuJobsAndTheCard(unittest.TestCase):

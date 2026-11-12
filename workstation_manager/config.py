@@ -104,6 +104,10 @@ class Config:
     reserve_cores: int = 1
     # Physical cores batch never takes, kept for pytest alone. None: it shares `reserve_cores`.
     lease_reserve_cores: int = 0
+    # Cores only small work may take: at most that many cores, planned (learned P80) to end
+    # within small_job_seconds. It fills them first, so short runs move along behind long ones.
+    small_lane_cores: int = 2
+    small_job_seconds: float = 1800.0
     # Memory kept free on top of every declared footprint (MemAvailable headroom).
     mem_margin_mib: int = 8192
     # What a pytest run asks for unless it says otherwise (WS_PYTEST_CORES /

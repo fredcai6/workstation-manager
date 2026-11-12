@@ -29,9 +29,15 @@ ws take / ws release                  operator override: stop everything / resum
 ```
 
 `--expect` is how long it should run (2h, 90m, 1h30m; required, or set `WS_EXPECT`,
-which launcher scripts pass through). It is an estimate: it places the work on the
-page's timeline and lets a short job fill a gap ahead of the first in line, and
-nothing is stopped for running over unless it went ahead that way. `ws submit` and
+which launcher scripts pass through). Guess; the broker corrects it. It learns from
+finished runs how far off guesses are (`workstation_manager/estimates.py`): overall,
+by where the work runs from, by its name and name stem, by the size of the guess, and
+by how loaded the box is, each shrunk toward the overall when its record is thin. It
+schedules on the learned upper time (P80) and the page shows the typical one. On the
+11-12 record that cut the median error of later runs from 3.6x to 2.7x, and 78% of
+runs ended within the P80. The estimate places the work on the page's timeline, lets
+a short job fill a gap ahead of the first in line, and decides what counts as small
+work; nothing is stopped for running over unless it went ahead that way. `ws submit` and
 `ws run` print what earlier runs of the same name took and peaked at. Without
 `--name`, work is named after its folder and script (`cfb-oracle: fit.py`).
 
@@ -135,9 +141,15 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   alone.) The queue also counts cores that unmanaged work keeps busy (smoothed over
   about 30 s) against its room, beyond the reserve, so it waits rather than piling onto
   an overloaded box.
+- **Small lane.** `small_lane_cores` (2) are only for small work: at most that many
+  cores, planned to end within `small_job_seconds` (30 min). Small work fills them
+  first and can use the rest too; other work never takes them. Small work that fits
+  in the lane starts even while a bigger job waits at the head of the queue, since it
+  takes nothing that one could use, so short runs keep moving behind long ones.
 - **Memory.** A holder starts only when its declaration fits both the budget
   (MemTotal less `mem_margin_mib`, 8 GB) and what is measured: MemAvailable less the
-  margin, less memory running holders have declared but not yet used.
+  margin. Memory running holders declared but have not used yet is not held back again:
+  each is capped at its declaration, and most peak near half of it.
 - **Order.** One queue holds jobs and `ws run` commands: highest `--priority` first
   (default 0; `ws priority ID N` changes a job's), then first come first served.
   pytest runs are the fast lane: they go first, first come first served, even during
