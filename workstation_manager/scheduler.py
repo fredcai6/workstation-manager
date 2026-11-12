@@ -46,7 +46,8 @@ Rules, in order:
    has it done before the first in line could start (project(): holders end at their
    estimates). If it runs past its
    estimate while the first in line waits, it is stopped and requeued, newest first,
-   when that makes room. A `ws run` never goes ahead this way: it cannot be stopped.
+   when that makes room. A `ws run` goes ahead this way only if it is small (rule 13):
+   it cannot be stopped, but it ends soon.
    Nothing else is ever stopped for running over.
 13. Small lane: `small_lane` cores are kept for small work (at most that many cores,
    planned to end within `small_seconds`). Small work fills them first, then the rest;
@@ -349,11 +350,13 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
             if (job.vram_mib and cap - (committed + job.vram_mib) < first.vram_mib) \
                     or not host.leaves_room_for(job, first):
                 # It may still go ahead if its estimate has it done before the first in
-                # line could start anyway. Only a job: it can be stopped if it runs over.
+                # line could start anyway. A job, which can be stopped if it runs over, or
+                # small work (a `ws run` too): if it runs over, the first waits at most a little.
                 if first.key not in shadows:
                     shadows[first.key] = project(v, margin_mib, [first], started_now)[first.key][0]
                 shadow = shadows[first.key]
-                if not (isinstance(job, Job) and job.expect_seconds and shadow is not None
+                if not ((isinstance(job, Job) or is_small(job, v.cpu)) and job.expect_seconds
+                        and shadow is not None
                         and v.now + job.expect_seconds <= shadow):
                     why[key] = f"held back for {label(first)} (first in line)"
                     continue
