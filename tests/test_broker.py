@@ -437,11 +437,12 @@ class TestThreads(Tmp):
     def test_past_runs_say_how_busy_the_cores_were(self):
         from workstation_manager.cli import past_runs
         for name, cores, cpu in (("wide", 4, 4 * 600 * 0.55), ("one", 4, 4 * 600 * 0.95),
-                                 ("both", 2, 2 * 600 * 1.9)):
+                                 ("both", 2, 2 * 600 * 1.9), ("pair", 2, 600 * 1.2)):
             self.store.attempt("job", 1, "done", 1600.0, started_at=1000.0, cores=cores,
                                usage={"cpu_seconds": cpu}, name=name)
         self.assertIn("kept 2.2 threads busy on 4 cores (about 2 would do)", past_runs(self.store, "wide"))
         self.assertIn("one per core", past_runs(self.store, "one"))
+        self.assertIn("kept 1.2 threads busy on 2 cores (about 1 would do)", past_runs(self.store, "pair"))
         self.assertTrue(past_runs(self.store, "both").endswith("kept 3.8 threads busy on 2 cores"))
 
 
