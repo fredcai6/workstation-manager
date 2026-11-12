@@ -27,12 +27,12 @@ def lease(id, cores=1, mem=2 * GB, status="waiting", cpus=None):
 
 
 def hview(queued=(), active=(), leases=(), busy=None, avail=50 * GB, unrealized=0,
-          pair="up", used=None, reserve=2, lease_reserve=0, borrow=0.0, **kw):
+          pair="up", used=None, reserve=2, lease_reserve=0, **kw):
     if used is None:
         used = (12000 if pair == "up" else 0) + sum(j.vram_mib for j in active)
     return View(now=10_000.0, queued=list(queued), active=list(active), pair=pair,
                 last_interactive_at=10_000.0, vram_total_mib=TOTAL, vram_used_mib=used,
-                cpu=CpuView(CORES, busy or [0.0] * 12, reserve, lease_reserve, borrow),
+                cpu=CpuView(CORES, busy or [0.0] * 12, reserve, lease_reserve),
                 mem=MemView(60 * GB, avail, 8 * GB, unrealized), leases=list(leases), **kw)
 
 
@@ -126,50 +126,17 @@ class TestLeases(unittest.TestCase):
         acts = run(hview(queued=[cjob(1, cores=8)], leases=[lease(7, cores=2)], lease_reserve=2))
         self.assertEqual([a[:2] for a in acts], [("grant_lease", 7), ("start_job", 1)])
 
-    def test_short_work_borrows_the_lease_cores(self):
-        # 11-12: 8 of 12 held by two long jobs; 1-core 5-minute runs waited hours behind them.
-        long = [dataclasses.replace(cjob(i, cores=4, status="running", cpus=[]), started_at=9_000.0,
-                                    expect_seconds=10_800) for i in (8, 9)]
-        short = dataclasses.replace(cjob(1), expect_seconds=300)
-        acts = run(hview(queued=[short], active=long, lease_reserve=2, borrow=900))
-        self.assertEqual([a[:2] for a in acts], [("start_job", 1)])
-        # Without a limit, or with an estimate past it, it still waits.
-        self.assertEqual(run(hview(queued=[short], active=long, lease_reserve=2)), [])
-        slow = dataclasses.replace(short, expect_seconds=1800)
-        self.assertEqual(run(hview(queued=[slow], active=long, lease_reserve=2, borrow=900)), [])
-        nothing = dataclasses.replace(short, expect_seconds=None)
-        self.assertEqual(run(hview(queued=[nothing], active=long, lease_reserve=2, borrow=900)), [])
-
-    def test_long_work_never_lands_on_borrowed_lease_cores(self):
-        # A short job borrows one pytest core; a long job freeing room still leaves both.
-        short = dataclasses.replace(cjob(5, status="running", cpus=[]), started_at=9_900.0,
-                                    expect_seconds=300)
-        held = dataclasses.replace(cjob(8, cores=4, status="running", cpus=[]), started_at=9_000.0,
-                                   expect_seconds=10_800)
-        acts = run(hview(queued=[cjob(1, cores=4)], active=[short, held], lease_reserve=2, borrow=900))
-        self.assertEqual(acts, [])          # 10 - 5 = 5 left, less the 2 kept: 3 < 4
-        acts = run(hview(queued=[cjob(1, cores=3)], active=[short, held], lease_reserve=2, borrow=900))
-        self.assertEqual([a[:2] for a in acts], [("start_job", 1)])
-        # Long work holds 8, a short job borrows one pytest core: a pytest finds one, and
-        # the borrower (done within 15 min) is all it waits for.
-        other = dataclasses.replace(held, id=9)
-        acts = run(hview(active=[short, held, other], leases=[lease(7, cores=2)],
-                         lease_reserve=2, borrow=900))
-        self.assertEqual(acts, [])
-        acts = run(hview(active=[short, held, other], leases=[lease(7)], lease_reserve=2, borrow=900))
+    def test_pytest_shares_the_reserve_core(self):
+        # 11-12: pytest held cores 1.7% of the time; it shares the desktop's core instead.
+        full = cjob(8, cores=11, status="running", cpus=[])
+        acts = run(hview(active=[full], leases=[lease(7)], reserve=1))
         self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])
-
-    def test_projection_lets_short_work_borrow(self):
-        from workstation_manager.scheduler import project
-        long = [dataclasses.replace(cjob(i, cores=4, status="running", cpus=[]), started_at=9_000.0,
-                                    expect_seconds=10_800) for i in (8, 9)]
-        a = dataclasses.replace(cjob(1), expect_seconds=300)
-        b = dataclasses.replace(cjob(2, cores=2), expect_seconds=600)
-        c = dataclasses.replace(cjob(3), expect_seconds=300)
-        p = project(hview(queued=[a, b, c], active=long, lease_reserve=2, borrow=900), MARGIN)
-        self.assertEqual(p["job:1"][:2], (10_000.0, 10_300.0))
-        self.assertEqual(p["job:2"][:2], (10_300.0, 10_900.0))   # 2 cores: waits for a to end
-        self.assertEqual(p["job:3"][:2], (10_900.0, 11_200.0))   # behind b in the projection
+        acts = run(hview(active=[full], leases=[lease(7, cores=2)], reserve=1))
+        self.assertEqual(acts, [])          # one core left: a 2-core run waits
+        # The queue still leaves the reserve alone.
+        self.assertEqual(run(hview(queued=[cjob(1, cores=12)], reserve=1)), [])
+        self.assertEqual([a[:2] for a in run(hview(queued=[cjob(1, cores=11)], reserve=1))],
+                         [("start_job", 1)])
 
     def test_granted_lease_holds_its_cores(self):
         acts = run(hview(queued=[cjob(1)], leases=[lease(7, status="granted", cpus=[0, 12])]))
@@ -181,7 +148,7 @@ class TestLeases(unittest.TestCase):
         self.assertIn(("stop_pair",), acts)
 
     def test_small_lease_does_not_overtake_a_big_one(self):
-        running = cjob(1, cores=8, status="running", cpus=[c for core in CORES[:8] for c in core])
+        running = cjob(1, cores=10, status="running", cpus=[c for core in CORES[:10] for c in core])
         acts = run(hview(active=[running], leases=[lease(7, cores=4), lease(8, cores=1)]))
         self.assertEqual(acts, [])
 
