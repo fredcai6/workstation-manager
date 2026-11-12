@@ -80,11 +80,14 @@ class TestMemory(unittest.TestCase):
     def test_measured_available_blocks(self):
         self.assertEqual(run(hview(queued=[cjob(1, mem=16 * GB)], avail=20 * GB)), [])
 
-    def test_memory_promised_but_not_yet_used_blocks(self):
-        acts = run(hview(queued=[cjob(1, mem=10 * GB)], avail=30 * GB, unrealized=14 * GB))
-        self.assertEqual(acts, [])
-        acts = run(hview(queued=[cjob(1, mem=10 * GB)], avail=30 * GB, unrealized=10 * GB))
+    def test_memory_declared_but_not_yet_used_is_not_held_back_twice(self):
+        # 11-12: runs peak at a median 50% of what they declare; holding the unused part
+        # back on top of the budget kept an 18 GB job waiting with ~23 GB to spare.
+        acts = run(hview(queued=[cjob(1, mem=18 * GB)], avail=30 * GB, unrealized=14 * GB))
         self.assertEqual([a[:2] for a in acts], [("start_job", 1)])
+        # The declared budget still binds: 40 GB declared leaves 12 of the 52 GB budget.
+        running = cjob(9, mem=40 * GB, status="running", cpus=[0, 12])
+        self.assertEqual(run(hview(queued=[cjob(1, mem=18 * GB)], active=[running], avail=30 * GB)), [])
 
 
 class TestCpuJobsAndTheCard(unittest.TestCase):

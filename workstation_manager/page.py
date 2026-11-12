@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .board import _ago, core_holders, estimate, host_summary, runs_held
+from .board import _ago, core_holders, estimate, expect_of, host_summary, runs_held
 from .store import describe
 
 # Reference palette (dataviz skill): categorical slots in fixed order, status
@@ -229,7 +229,7 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                    f'<div class="v">{_gb(h["mem_available_mib"])} available of {_gb(h["mem_total_mib"])}</div>'
                    f'<div class="n">holders shown at what they declared'
                    + (f' · <b>room for new work {_gb(h["mem_room_mib"])}</b> (after the {_gb((b.get("mem") or {}).get("margin_mib") or 0)} margin '
-                      f'and {_gb((b.get("mem") or {}).get("unrealized_mib") or 0)} declared but not yet used)'
+                      f'; {_gb((b.get("mem") or {}).get("unrealized_mib") or 0)} declared but not yet used)'
                       if h.get("mem_room_mib") is not None else "")
                    + f'</div>{_memory(s, h)}</div>')
         out.append(f'<div class="tile"><div class="k">Interactive tier</div>'
@@ -313,7 +313,9 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
                 pj = proj.get(j["key"])
                 starts = ("now" if pj[0] <= now + 60 else f"~{time.strftime('%H:%M', time.localtime(pj[0]))}") \
                     if pj and pj[0] else '<span title="behind work with no estimate">?</span>'
-                exp = _ago(j["expect_seconds"]) if j.get("expect_seconds") else '<span class="why">none</span>'
+                e, enote = expect_of(s, j["key"], j.get("expect_seconds"))
+                exp = (_ago(e) + (f'<span class="why">{_e(enote)}</span>' if enote else "")) \
+                    if e else '<span class="why">none</span>'
                 out.append(f'<tr{band}><td class="num">{n}</td><td>{_pri(pri)}</td>'
                            f'<td>{_e(j["label"])}{note}</td>'
                            f'<td>{_e(describe(j.get("cores") or 1, j.get("mem_mib") or 0, j["vram_mib"], j.get("legacy")))}</td>'

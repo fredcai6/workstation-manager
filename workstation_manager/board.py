@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Config
 from .store import ACTIVE, Store, describe
@@ -67,16 +67,25 @@ def runs_held(s: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [l for l in s.get("leases", ()) if l["status"] == "granted" and not l.get("fast")]
 
 
+def expect_of(s: Dict[str, Any], key: str, given: Optional[int]) -> Tuple[Optional[int], str]:
+    """The estimate the scheduler uses for `key`, and a note when it comes from past runs."""
+    past = ((s.get("broker") or {}).get("estimates") or {}).get(key)
+    if past:
+        return past, " (past runs" + (f"; --expect {_ago(given)}" if given else "") + ")"
+    return given, ""
+
+
 def estimate(s: Dict[str, Any], key: str, started: Optional[float], expect: Optional[int]) -> str:
     """e.g. "expected 2.0h, ends ~14:10" or "over its 1.0h estimate by 40m"."""
     now = s["at"]
     proj = (((s.get("broker") or {}).get("projection")) or {}).get(key)
+    expect, note = expect_of(s, key, expect)
     if not expect:
         return "no estimate"
     if started and now > started + expect:
-        return f"over its {_ago(expect)} estimate by {_ago(now - started - expect)}"
+        return f"over its {_ago(expect)} estimate{note} by {_ago(now - started - expect)}"
     end = proj[1] if proj and proj[1] else (started + expect if started else None)
-    return f"expected {_ago(expect)}" + (f", ends ~{time.strftime('%H:%M', time.localtime(end))}" if end else "")
+    return f"expected {_ago(expect)}{note}" + (f", ends ~{time.strftime('%H:%M', time.localtime(end))}" if end else "")
 
 
 def core_holders(s: Dict[str, Any]) -> List[Optional[str]]:
@@ -108,10 +117,8 @@ def host_summary(s: Dict[str, Any]) -> Dict[str, Any]:
     room = None
     if mem.get("total_mib") and mem.get("available_mib") is not None:
         margin = mem.get("margin_mib") or 0
-        # As the scheduler sees it: the declared budget and what is measured, less
-        # memory holders have declared but not yet used.
-        room = max(0, min(mem["total_mib"] - margin - declared,
-                          mem["available_mib"] - margin - (mem.get("unrealized_mib") or 0)))
+        # As the scheduler sees it: the declared budget and what is measured.
+        room = max(0, min(mem["total_mib"] - margin - declared, mem["available_mib"] - margin))
     return {
         "mem_room_mib": room,
         "cores": len(holders),
@@ -211,7 +218,8 @@ def render_text(s: Dict[str, Any]) -> str:
         extra = f", {j['interruptions']} interruption(s)" if j["interruptions"] else ""
         p = proj.get(j["key"])
         when = f", starts ~{time.strftime('%H:%M', time.localtime(p[0]))}" if p and p[0] and p[0] > now + 60 else ""
-        exp = f", expected {_ago(j['expect_seconds'])}" if j.get("expect_seconds") else ", no estimate"
+        e, note = expect_of(s, j["key"], j.get("expect_seconds"))
+        exp = f", expected {_ago(e)}{note}" if e else ", no estimate"
         out.append(f"    {n}. [{j.get('priority') or 0:+d}] {j['label']}  "
                    f"{describe(j.get('cores') or 1, j.get('mem_mib') or 0, j['vram_mib'], j.get('legacy'))}  waiting "
                    f"{_ago(now - j['submitted_at'])}{exp}{when}{extra}")
