@@ -79,6 +79,10 @@ class Daemon:
         self.model: Optional[estimates.Model] = None
         self.model_at = 0.0
         self.learned: dict = {}         # key -> (typical, plan) seconds, this tick
+        self.mem_model: Optional[estimates.Model] = None
+        self.mem_used: dict = {}        # key -> MiB a running holder uses now
+        self.charged: dict = {}         # key -> MiB the scheduler counts for it, this tick
+        self.seen_leases: dict = {}     # id -> granted lease, to record it once it ends
         # The hold runs from the owner's last assistant request, across restarts.
         self.gate.last_interactive_at = self.store.get_kv("last_interactive_at", 0.0)
 
@@ -161,16 +165,19 @@ class Daemon:
             self.store.event(before.id, text)
 
     def reconcile_leases(self) -> None:
-        for lease in self.store.leases():
+        current = self.store.leases()
+        for lease in current:
             if not cpu.alive(lease.pid, lease.pid_start):
                 self.store.end_lease(lease.id)
-                now = time.time()
-                usage = self.lease_usage.pop(lease.id, {})
-                self.store.attempt("lease", lease.id, "ended" if lease.granted_at else "gave up", now,
-                                   usage, name=f"{lease.kind} {lease.name}",
-                                   started_at=lease.granted_at or lease.requested_at,
-                                   cores=lease.cores, mem_mib=lease.mem_mib, vram_mib=0,
-                                   priority=lease.priority, expect_seconds=lease.expect_seconds)
+                self._record_lease(lease)
+        # A lease its command ended itself (the usual way a `ws run` or pytest finishes)
+        # is gone from the list: record it too, with what it used.
+        live = {l.id for l in current}
+        for lid, lease in list(self.seen_leases.items()):
+            if lid not in live:
+                self._record_lease(lease, ended=(self.store.lease(lid) or lease).ended_at)
+        self.seen_leases = {l.id: l for l in current if l.status == "granted"
+                            and cpu.alive(l.pid, l.pid_start)}
         self.store.prune_leases(time.time() - 86400)
 
     def _cgroup(self, unit: str):
@@ -187,11 +194,13 @@ class Daemon:
         busy = self.meter.sample()
         total, available = cpu.meminfo()
         unrealized = 0
+        self.mem_used = {}
         for j in active:
             if j.mem_mib:
                 used = (cpu.memory_current_mib(self._cgroup(j.unit)) or 0) \
                     + cpu.container_memory_mib(runner.label(j))
                 unrealized += max(0, j.mem_mib - used)
+                self.mem_used[j.key] = used
         for l in leases:
             if l.status != "granted":
                 continue
@@ -200,6 +209,7 @@ class Daemon:
             if used is None:
                 used = cpu.rss_mib(l.pid)
             unrealized += max(0, l.mem_mib - used)
+            self.mem_used[l.key] = used or 0
             # What it has used, kept while it runs: its scope is gone once it ends.
             cpu_s, peak = cpu.cgroup_usage(cg) if cg else (None, None)
             u = self.lease_usage.setdefault(l.id, {})
@@ -401,9 +411,14 @@ class Daemon:
             except Exception:
                 log.exception("learning run times failed; using --expect as given")
                 self.model = None
+            try:
+                self.mem_model = estimates.fit_memory(estimates.memory_runs_from(self.store.db))
+            except Exception:
+                log.exception("learning memory peaks failed; counting declarations")
+                self.mem_model = None
             self.model_at = now
         load = sum(self.box_load(active, leases, cpu_view)) if cpu_view else None
-        self.learned = {}
+        self.learned, self.charged = {}, {}
         queued, active_v, leases = (self._learned(hs, load) for hs in (queued, active, leases))
         view = scheduler.View(
             now=time.time(),
@@ -441,6 +456,7 @@ class Daemon:
                                      "waiting_on": why,
                                      "estimates": {k: list(v) for k, v in self.learned.items()},
                                      "model": self.model.summary() if self.model else None,
+                                     "mem_charged": dict(self.charged),
                                      "projection": {k: list(v) for k, v in
                                                     scheduler.project(view, self.cfg.margin_mib).items()},
                                      "cpu": {"cores": [list(c) for c in cpu_view.cores],
@@ -451,6 +467,17 @@ class Daemon:
                                              "available_mib": mem_view.available_mib,
                                              "margin_mib": mem_view.margin_mib,
                                              "unrealized_mib": mem_view.unrealized_mib}})
+
+    def _record_lease(self, lease, ended=None) -> None:
+        self.seen_leases.pop(lease.id, None)
+        usage = self.lease_usage.pop(lease.id, {})
+        # A `ws run` under its own name, so run times and peaks are learned by it.
+        name = lease.name if lease.kind == "run" else f"{lease.kind} {lease.name}"
+        self.store.attempt("lease", lease.id, "ended" if lease.granted_at else "gave up",
+                           ended or time.time(), usage, name=name,
+                           started_at=lease.granted_at or lease.requested_at,
+                           cores=lease.cores, mem_mib=lease.mem_mib, vram_mib=0,
+                           priority=lease.priority, expect_seconds=lease.expect_seconds)
 
     def _learned(self, holders, load):
         """`holders` with expect_seconds set to the learned upper (P80) run time, which the
@@ -464,6 +491,15 @@ class Daemon:
             if got:
                 self.learned[h.key] = (round(got[0]), round(got[1]))
                 h = dataclasses.replace(h, expect_seconds=max(1, round(got[1])))
+            # Memory: the learned P95 peak, or what it already uses if that is more.
+            charge = None if getattr(h, "fast", False) else estimates.memory_charge(
+                self.mem_model, h.name, estimates.where_of(getattr(h, "argv", None) or [], h.cwd or ""),
+                h.mem_mib)
+            if charge is not None:
+                charge = min(h.mem_mib, max(charge, self.mem_used.get(h.key, 0)))
+                if charge < h.mem_mib:
+                    self.charged[h.key] = charge
+                    h = dataclasses.replace(h, mem_mib=charge)
             out.append(h)
         return out
 

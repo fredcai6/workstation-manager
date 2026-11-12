@@ -149,7 +149,12 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
 - **Memory.** A holder starts only when its declaration fits both the budget
   (MemTotal less `mem_margin_mib`, 8 GB) and what is measured: MemAvailable less the
   margin. Memory running holders declared but have not used yet is not held back again:
-  each is capped at its declaration, and most peak near half of it.
+  each is capped at its declaration, and most peak near half of it. Each holder is
+  counted at its learned peak, not its declaration: the same model as run times, on
+  peak / declared, with the P95 (wider where few runs of its name or stem are known),
+  never more than the declaration and never less than what a running one uses now.
+  On the 11-12 record 97% of later runs peaked within it, and it counted 91% of what was
+  declared; that falls as names recur. The kill limit stays at the declaration.
 - **Order.** One queue holds jobs and `ws run` commands: highest `--priority` first
   (default 0; `ws priority ID N` changes a job's), then first come first served.
   pytest runs are the fast lane: they go first, first come first served, even during

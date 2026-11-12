@@ -83,17 +83,14 @@ def _levels(r: Run) -> Dict[str, str]:
     return {"where": r.where, "stem": stem(r.name), "name": r.name}
 
 
-def fit(runs: Iterable[Run], guess_slope: bool = True) -> Optional[Model]:
-    runs = [r for r in runs if r.expect and r.expect > 0 and r.took and r.took > 0]
-    if len(runs) < MIN_RUNS:
-        return None
-    y = [math.log(r.took / r.expect) for r in runs]
-    loads = [r.load for r in runs if r.load is not None]
+def _fit(y, base, load, lv, guess_slope=True):
+    """Backfitted shrunken means on y = log(observed / base): an overall shift, slopes on
+    load (None: none) and on log base, and effects by where, stem and name."""
+    loads = [v for v in load if v is not None]
     load_mean = sum(loads) / len(loads) if loads else 0.0
-    x = [(r.load - load_mean) if r.load is not None else 0.0 for r in runs]
-    guess_mean = sum(math.log(r.expect) for r in runs) / len(runs)
-    g = [math.log(r.expect) - guess_mean for r in runs]
-    lv = [_levels(r) for r in runs]
+    x = [(v - load_mean) if v is not None else 0.0 for v in load]
+    guess_mean = sum(math.log(b) for b in base) / len(base)
+    g = [math.log(b) - guess_mean for b in base]
     effects: Dict[str, Dict[str, Tuple[float, int]]] = {k: {} for k in ("where", "stem", "name")}
     mu = beta = gamma = 0.0
     eff = lambda i, skip=None: sum(effects[k].get(lv[i][k], (0.0, 0))[0] for k in effects if k != skip)
@@ -101,7 +98,8 @@ def fit(runs: Iterable[Run], guess_slope: bool = True) -> Optional[Model]:
     slope = lambda xs, r: sum(a * b for a, b in zip(xs, r)) / (sum(a * a for a in xs) + 4.0)
     for _ in range(PASSES):
         mu = sum(y[i] - beta * x[i] - gamma * g[i] - eff(i) for i in range(len(y))) / len(y)
-        beta = slope(x, [y[i] - mu - gamma * g[i] - eff(i) for i in range(len(y))])
+        if loads:
+            beta = slope(x, [y[i] - mu - gamma * g[i] - eff(i) for i in range(len(y))])
         if guess_slope:
             gamma = slope(g, [y[i] - mu - beta * x[i] - eff(i) for i in range(len(y))])
         for k in effects:
@@ -111,7 +109,15 @@ def fit(runs: Iterable[Run], guess_slope: bool = True) -> Optional[Model]:
             effects[k] = {grp: (sum(v) / (len(v) + SHRINK), len(v)) for grp, v in sums.items()}
     resid = [y[i] - mu - beta * x[i] - gamma * g[i] - eff(i) for i in range(len(y))]
     sigma = math.sqrt(sum(e * e for e in resid) / max(1, len(resid) - 1))
-    return Model(len(runs), mu, beta, load_mean, sigma, effects, gamma, guess_mean)
+    return Model(len(y), mu, beta, load_mean, sigma, effects, gamma, guess_mean)
+
+
+def fit(runs: Iterable[Run], guess_slope: bool = True) -> Optional[Model]:
+    runs = [r for r in runs if r.expect and r.expect > 0 and r.took and r.took > 0]
+    if len(runs) < MIN_RUNS:
+        return None
+    return _fit([math.log(r.took / r.expect) for r in runs], [r.expect for r in runs],
+                [r.load for r in runs], [_levels(r) for r in runs], guess_slope)
 
 
 def predict(m: Optional[Model], name: str, where: str, expect: Optional[float],
@@ -119,15 +125,72 @@ def predict(m: Optional[Model], name: str, where: str, expect: Optional[float],
     """(typical seconds, P80 seconds) for a run, or None without a guess or a model."""
     if not m or not expect:
         return None
-    lv = {"where": where, "stem": stem(name), "name": name}
-    mean = math.log(expect) + m.mu + m.gamma * (math.log(expect) - m.guess_mean) \
-        + sum(m.effects[k].get(g, (0.0, 0))[0] for k, g in lv.items())
+    mean, known = _mean(m, name, where, expect)
     if load is not None:
         mean += m.beta * (load - m.load_mean)
     # Less known about this run (no runs of its name or stem): a wider upper estimate.
-    known = max(m.effects["name"].get(name, (0, 0))[1], m.effects["stem"].get(lv["stem"], (0, 0))[1])
     spread = m.sigma * math.sqrt(1 + 1 / (known + 1))
     return math.exp(mean), math.exp(mean + Z80 * spread)
+
+
+def _mean(m: Model, name: str, where: str, base: float) -> Tuple[float, int]:
+    """The model's log prediction for a run (without load), and how many runs of its
+    name or stem it has seen."""
+    lv = {"where": where, "stem": stem(name), "name": name}
+    mean = math.log(base) + m.mu + m.gamma * (math.log(base) - m.guess_mean) \
+        + sum(m.effects[k].get(g, (0.0, 0))[0] for k, g in lv.items())
+    known = max(m.effects["name"].get(name, (0, 0))[1], m.effects["stem"].get(lv["stem"], (0, 0))[1])
+    return mean, known
+
+
+# -- memory: what a run peaks at, given what it declared ----------------------------
+#
+# Same model on log(peak / declared), without load (memory does not depend on it). The
+# scheduler charges a run its P95 peak, not its declaration: declarations are padded
+# (the median run peaks at half), and each run is still killed at its declaration, so
+# the charge never goes above it. A run with no runs of its name or stem behind it gets
+# a wider P95, so new work is charged near what it declared.
+
+Z95 = 1.6449
+
+
+@dataclasses.dataclass
+class MemRun:
+    name: str
+    where: str
+    declared: float             # MiB
+    peak: float                 # MiB
+
+
+def fit_memory(runs: Iterable[MemRun]) -> Optional[Model]:
+    runs = [r for r in runs if r.declared > 0 and r.peak > 0]
+    if len(runs) < MIN_RUNS:
+        return None
+    # A peak at or past the declaration was cut off there (killed): it says "at least".
+    return _fit([math.log(min(r.peak, r.declared) / r.declared) for r in runs], [r.declared for r in runs],
+                [None] * len(runs), [{"where": r.where, "stem": stem(r.name), "name": r.name} for r in runs])
+
+
+def memory_charge(m: Optional[Model], name: str, where: str, declared: Optional[int]) -> Optional[int]:
+    """MiB the scheduler counts for a run: its learned P95 peak, at most its declaration."""
+    if not m or not declared:
+        return None
+    mean, known = _mean(m, name, where, declared)
+    spread = m.sigma * math.sqrt(1 + 1 / (known + 1))
+    return int(min(declared, math.ceil(math.exp(mean + Z95 * spread))))
+
+
+def memory_runs_from(db) -> List[MemRun]:
+    """Peaks of finished attempts. Cancelled and requeued attempts stopped part way, so
+    their peaks may be short of a full run's; they are left out."""
+    rows = db.execute(
+        "SELECT a.name, a.mem_mib, a.peak_mib, j.argv, j.cwd, l.cwd FROM attempts a"
+        " LEFT JOIN jobs j ON a.kind='job' AND j.id=a.ref"
+        " LEFT JOIN leases l ON a.kind='lease' AND l.id=a.ref"
+        " WHERE a.peak_mib > 0 AND a.mem_mib > 0 AND a.outcome IN ('done','failed','retry','ended')"
+        " AND a.ended_at - a.started_at > 60").fetchall()
+    return [MemRun(name, where_of(json.loads(argv) if argv else [], jcwd or lcwd or ""), mem, peak)
+            for name, mem, peak, argv, jcwd, lcwd in rows]
 
 
 def runs_from(db, samples: bool = True) -> List[Run]:
