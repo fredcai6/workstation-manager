@@ -35,8 +35,9 @@ Rules, in order:
    cores. A `ws run` waits in the queue with jobs: same order, same room checks, and
    it is granted where a job would start (it runs in its caller's terminal).
 11. Priority: the queue is in priority order (highest first, then first come). When
-   the first job waiting for the card cannot fit, running jobs of lower priority are
-   stopped and requeued, newest first, until it would, if stopping them is enough.
+   the first in line cannot fit, on the card, in memory or on the cores, running jobs
+   of lower priority are stopped and requeued, newest first, until it would, if
+   stopping them is enough, and no more than it needs.
    Jobs that are already stopping count as gone. Not during a reserve window.
 12. Estimates: every job and `ws run` says how long it should run (--expect). A later
    job that does not leave room for the first in line may still start if its estimate
@@ -341,14 +342,17 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     if waiting and not v.take:
         actions += _overrun_stops(v, waiting[0], host, cap - committed - pair_mib, why)
 
-    # Only jobs that need the card keep the pair away or send it off.
-    waiting = [j for j in waiting if j.vram_mib > 0]
+    # The first in line stops running jobs of lower priority until it fits.
     if waiting and not v.reserved:
-        made = _make_room(v, waiting[0], cap - committed - pair_mib)
+        gone = {a[1] for a in actions if a[0] == "stop_job"}
+        made = _make_room(v, waiting[0], host, cap - committed - pair_mib, gone)
         if made:
-            why[f"job:{waiting[0].id}"] = "stopping lower-priority " + \
+            why[waiting[0].key] = "stopping lower-priority " + \
                 ", ".join(f"#{a[1]}" for a in made) + " to make room"
         actions += made
+
+    # Only jobs that need the card keep the pair away or send it off.
+    waiting = [j for j in waiting if j.vram_mib > 0]
     if v.reserved:
         if v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
             actions.append(("start_pair", want))
@@ -471,19 +475,38 @@ def _overrun_stops(v: View, first, host: "Host", vram_room: int, why: Dict[str, 
     return []
 
 
-def _make_room(v: View, first: Job, room_mib: int) -> List[Action]:
-    """Stop lower-priority running jobs, newest first, so `first` fits on the card."""
-    room_mib += sum(j.vram_mib for j in v.active if j.status == "stopping")
-    if first.vram_mib <= room_mib:
+def _make_room(v: View, first, host: "Host", vram_room: int, gone=frozenset()) -> List[Action]:
+    """Stop lower-priority running jobs, newest first, so `first` fits on the card, in
+    memory and on the cores. Jobs already stopping (or in `gone`, stopped this tick)
+    count as freed. Stops no more than it needs: one that `first` would fit without is dropped."""
+    # Room `first` sees on each resource: VRAM, memory, cores.
+    room = [vram_room,
+            host.mem_room if host.mem else 10 ** 9,
+            (host.cores_cap - host.cores_committed - host.unmanaged_over
+             - max(0, host.cpu.lease_reserve - host.fast_cores)) if host.cpu else 10 ** 6]
+    need = [first.vram_mib, first.mem_mib if host.mem else 0, cores_of(first) if host.cpu else 0]
+    held = lambda j: [j.vram_mib, j.mem_mib if host.mem else 0, cores_of(j) if host.cpu else 0]
+    for j in v.active:
+        if j.status == "stopping" or j.id in gone:
+            room = [r + h for r, h in zip(room, held(j))]
+    short = lambda: [n > r for n, r in zip(need, room)]
+    if not any(short()):
         return []
-    below = [j for j in v.active if j.status == "running" and j.vram_mib
+    below = [j for j in v.active if j.status == "running" and j.id not in gone
              and j.priority < first.priority]
-    if first.vram_mib > room_mib + sum(j.vram_mib for j in below):
+    total = [r + sum(held(j)[k] for j in below) for k, r in enumerate(room)]
+    if any(n > t for n, t in zip(need, total)):
         return []  # stopping them would not be enough
-    actions: List[Action] = []
+    stops = []
     for j in sorted(below, key=lambda j: j.started_at or 0, reverse=True):
-        if first.vram_mib <= room_mib:
+        if not any(short()):
             break
-        actions.append(("stop_job", j.id, "requeue"))
-        room_mib += j.vram_mib
-    return actions
+        stops.append(j)
+        room = [r + h for r, h in zip(room, held(j))]
+    # Keep only the stops it needs: a newer small job passed on the way is spared.
+    for j in list(stops):
+        less = [r - h for r, h in zip(room, held(j))]
+        if all(n <= r for n, r in zip(need, less)):
+            stops.remove(j)
+            room = less
+    return [("stop_job", j.id, "requeue") for j in stops]

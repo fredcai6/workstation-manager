@@ -135,9 +135,10 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   pytest runs are the fast lane: they go first, first come first served, even during
   a take. A later job may go ahead of the first in line when its `--expect` has it
   done before that one could start; if it then runs over while the first waits, it is
-  stopped and requeued. When the first job waiting for the card
-  cannot fit, running jobs of lower priority are stopped and requeued, newest first,
-  until it would (never in a reserve window), so give priority only to work that
+  stopped and requeued. When the first in line cannot fit, on the card,
+  in memory or on the cores, running jobs of lower priority are stopped and requeued,
+  newest first, until it would, and no more than it needs (never in a reserve window;
+  a `ws run` is never stopped, but one with priority can stop jobs), so give priority only to work that
   should interrupt others, and only to jobs that resume. A later job may start ahead of the
   head only if the head would still fit once running work is gone, in every
   resource the later job uses. A CPU-only job neither waits for the pair nor sends

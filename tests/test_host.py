@@ -277,7 +277,7 @@ class TestOneQueue(unittest.TestCase):
     """Jobs and `ws run` share one queue; pytest keeps its fast lane."""
 
     def test_ws_run_takes_its_place_by_priority(self):
-        busy = held(9, 6)
+        busy = dataclasses.replace(held(9, 6), priority=5)   # not stopped: order only
         acts = run(hview(queued=[cjob(1, cores=2)], leases=[rlease(7, cores=2, priority=5)],
                          active=[busy], lease_reserve=2))
         self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])
@@ -361,3 +361,65 @@ class TestEstimates(unittest.TestCase):
         self.assertEqual(expected_end(dataclasses.replace(j, expect_seconds=None), 10_000.0), (None, False))
         late = dataclasses.replace(self.busy, started_at=1_000.0, chunk=None, chunks=None)
         self.assertEqual(expected_end(late, 10_000.0), (10_600.0, True))
+
+
+class TestPriorityAcrossResources(unittest.TestCase):
+    """Priority stops lower-priority running jobs for memory and cores, as for the card."""
+
+    def go(self, queued, active, leases=(), why=None, **kw):
+        return decide(hview(queued=queued, active=active, leases=leases, **kw),
+                      MARGIN, 12500, 30, False, why)
+
+    def hot(self, id=1, **kw):
+        return dataclasses.replace(cjob(id, **kw), priority=10)
+
+    def test_memory(self):
+        low = held(5, 1, mem=40 * GB)
+        why = {}
+        acts = self.go([self.hot(mem=16 * GB)], [low], why=why)
+        self.assertEqual(acts, [("stop_job", 5, "requeue")])
+        self.assertEqual(why["job:1"], "stopping lower-priority #5 to make room")
+
+    def test_cores(self):
+        low = held(5, 8)
+        self.assertEqual(self.go([self.hot(cores=4)], [low]), [("stop_job", 5, "requeue")])
+
+    def test_newest_first_and_only_what_is_short(self):
+        old = held(5, 1, start=1_000.0, mem=20 * GB)
+        new_cpu = dataclasses.replace(held(6, 1, start=2_000.0, mem=1 * GB), cpus=[6, 18])
+        new_mem = dataclasses.replace(held(7, 1, start=3_000.0, mem=20 * GB), cpus=[1, 13])
+        # 52 GB budget, 41 committed: needs 20 GB, so one 20 GB job goes, the newest.
+        acts = self.go([self.hot(mem=20 * GB)], [old, new_cpu, new_mem])
+        self.assertEqual(acts, [("stop_job", 7, "requeue")])
+        # A newer small job is passed over: stopping it is not needed.
+        newest_cpu = dataclasses.replace(new_cpu, started_at=4_000.0)
+        acts = self.go([self.hot(mem=20 * GB)], [old, newest_cpu, new_mem])
+        self.assertEqual(acts, [("stop_job", 7, "requeue")])
+
+    def test_equal_or_higher_priority_and_not_enough_stop_nothing(self):
+        low = held(5, 1, mem=40 * GB)
+        self.assertEqual(self.go([cjob(1, mem=16 * GB)], [low]), [])
+        self.assertEqual(self.go([self.hot(mem=16 * GB)], [dataclasses.replace(low, priority=10)]), [])
+        # Unmanaged memory use leaves too little even with the 12 GB job gone (2 + 12 < 16).
+        small = held(5, 1, mem=12 * GB)
+        self.assertEqual(self.go([self.hot(mem=16 * GB)], [small], avail=10 * GB), [])
+
+    def test_stopping_jobs_count_as_gone(self):
+        low = dataclasses.replace(held(5, 1, mem=40 * GB), status="stopping")
+        self.assertEqual(self.go([self.hot(mem=16 * GB)], [low]), [])
+
+    def test_not_in_a_reserve_window(self):
+        low = held(5, 1, mem=40 * GB)
+        self.assertEqual(self.go([self.hot(mem=16 * GB)], [low], reserved=True), [])
+
+    def test_ws_run_with_priority_makes_room(self):
+        low = held(5, 1, mem=40 * GB)
+        acts = self.go([], [low], leases=[rlease(7, mem=16 * GB, priority=10)])
+        self.assertEqual(acts, [("stop_job", 5, "requeue")])
+
+    def test_overrun_stop_is_not_repeated(self):
+        over = held(5, 4, start=5_000.0, expect=1800, backfill=True)
+        busy = held(9, 4, start=10_000.0, expect=3600)
+        busy = dataclasses.replace(busy, cpus=[c for core in CORES[4:8] for c in core])
+        acts = self.go([self.hot(cores=4)], [busy, over], lease_reserve=2)
+        self.assertEqual(acts, [("stop_job", 5, "requeue")])

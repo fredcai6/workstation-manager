@@ -292,7 +292,7 @@ def render(s: Dict[str, Any], pair_vram_mib: int = 30000) -> str:
             out.append(f'<p class="muted">Jobs and <code>ws run</code> commands, in the order they start: highest '
                        f'priority first, then first come. A later job may go ahead when its estimate has it done '
                        f'before the first in line could start; if it runs over, it is stopped and requeued. '
-                       f'A job that needs the card stops running jobs of lower priority. pytest runs skip the queue. '
+                       f'The first in line stops running jobs of lower priority when it needs their cores, memory or card. pytest runs skip the queue. '
                        f'Start times are estimates from what everyone declared.</p><p class="muted">{stack}</p>')
             out.append('<table><tr><th class="num">#</th><th>Priority</th><th>Job</th><th>Needs</th>'
                        '<th>Expect</th><th>Waiting</th><th>Starts</th><th>Held up by</th></tr>')
