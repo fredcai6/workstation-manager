@@ -99,11 +99,11 @@ class Config:
     # Physical cores never handed to managed work: left for the desktop, agents, the
     # interactive pair and this broker. Cores busy with unmanaged work also count
     # against the room, so this is a floor.
-    reserve_cores: int = 2
-    # Physical cores kept for pytest runs: the queue (jobs and `ws run`) takes them only
-    # for work expected to end within lease_borrow_seconds, so a pytest waits at most that.
-    lease_reserve_cores: int = 2
-    lease_borrow_seconds: float = 900.0
+    # pytest runs may use these too: they are rare and short (1.7% of the time, ~2.5 min,
+    # 1 core over 3 days to 2026-11-12), so briefly sharing a core with the desktop is cheap.
+    reserve_cores: int = 1
+    # Physical cores batch never takes, kept for pytest alone. None: it shares `reserve_cores`.
+    lease_reserve_cores: int = 0
     # Memory kept free on top of every declared footprint (MemAvailable headroom).
     mem_margin_mib: int = 8192
     # What a pytest run asks for unless it says otherwise (WS_PYTEST_CORES /

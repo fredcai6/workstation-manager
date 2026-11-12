@@ -121,14 +121,14 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   in the order 0, 6, 1, 7, ... (each with its sibling, 12, 18, 13, 19, ...).
   Pinning is CPU affinity only: nothing stops unmanaged processes from running on a
   held core.
-- **Room.** `reserve_cores` (2) are never handed out: they are left for the desktop,
-  agents, the interactive pair and the broker. `lease_reserve_cores` (2) are kept
-  for pytest. The queue borrows them only for work whose `--expect` is at most
-  `lease_borrow_seconds` (15 min), so short runs don't wait behind long ones, and a
-  pytest that finds them taken waits no longer than it already may. Everything in the queue (jobs and `ws run`)
-  also counts cores that unmanaged work keeps busy (smoothed over about 30 s) against
-  its room, so it waits rather than piling onto an overloaded box. A pytest run counts
-  declarations only.
+- **Room.** The queue (jobs and `ws run`) never takes the last `reserve_cores` (1):
+  it is left for the desktop, agents, the interactive pair and the broker. pytest runs
+  share it: they are rare and short, so a few minutes of two things on one core costs
+  little. A pytest counts declarations only, so it starts at once unless managed work
+  holds every core. (`lease_reserve_cores`, default 0, would keep cores for pytest
+  alone.) The queue also counts cores that unmanaged work keeps busy (smoothed over
+  about 30 s) against its room, beyond the reserve, so it waits rather than piling onto
+  an overloaded box.
 - **Memory.** A holder starts only when its declaration fits both the budget
   (MemTotal less `mem_margin_mib`, 8 GB) and what is measured: MemAvailable less the
   margin, less memory running holders have declared but not yet used.
