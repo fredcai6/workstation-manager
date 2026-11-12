@@ -100,8 +100,10 @@ class Config:
     # interactive pair and this broker. Cores busy with unmanaged work also count
     # against the room, so this is a floor.
     reserve_cores: int = 2
-    # Physical cores batch jobs never take, kept for pytest runs and `ws run`.
+    # Physical cores kept for pytest runs: the queue (jobs and `ws run`) takes them only
+    # for work expected to end within lease_borrow_seconds, so a pytest waits at most that.
     lease_reserve_cores: int = 2
+    lease_borrow_seconds: float = 900.0
     # Memory kept free on top of every declared footprint (MemAvailable headroom).
     mem_margin_mib: int = 8192
     # What a pytest run asks for unless it says otherwise (WS_PYTEST_CORES /

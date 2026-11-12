@@ -204,7 +204,7 @@ class Daemon:
         live = {j.unit for j in active} | {l.unit for l in leases if l.unit}
         self.cgroups = {u: p for u, p in self.cgroups.items() if u in live}
         return (scheduler.CpuView([c.cpus for c in self.cores], list(busy), self.cfg.reserve_cores,
-                                   self.cfg.lease_reserve_cores),
+                                   self.cfg.lease_reserve_cores, self.cfg.lease_borrow_seconds),
                 scheduler.MemView(total, available, self.cfg.mem_margin_mib, unrealized))
 
     def observe_pair(self) -> None:

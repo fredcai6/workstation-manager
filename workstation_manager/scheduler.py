@@ -27,7 +27,8 @@ Rules, in order:
    that running holders have declared but not yet used counts against
    MemAvailable, and for batch jobs cores busy outside managed work count against
    the room too. A lease has a caller waiting and skips that last check, and
-   `lease_reserve` cores are kept for leases: batch never takes them. A job gets whole physical cores, least busy first
+   `lease_reserve` cores are kept for pytest: queued work takes them only when its
+   estimate has it done within `borrow_seconds`, so a pytest waits at most that. A job gets whole physical cores, least busy first
    in CCD-alternating order. The rules above about the card apply to jobs that
    declare VRAM; a CPU-only job neither waits for the pair nor sends it away.
 10. pytest runs are the fast lane: granted ahead of the queue, first come first served,
@@ -71,6 +72,7 @@ class CpuView:
     busy: Sequence[float]
     reserve: int = 2
     lease_reserve: int = 0          # cores batch never takes, so a pytest need not wait for it
+    borrow_seconds: float = 0.0     # ...except work expected to end within this (0: none may)
 
 
 @dataclasses.dataclass
@@ -119,6 +121,13 @@ def cores_of(h) -> int:
     return 0 if getattr(h, "legacy", False) else h.cores
 
 
+def borrows(h, cpu: Optional[CpuView]) -> bool:
+    """Whether queued `h` may use the `lease_reserve` cores: its estimate has it done
+    within `borrow_seconds`, so a pytest that finds them taken waits no longer than that."""
+    return bool(cpu and cpu.borrow_seconds and getattr(h, "expect_seconds", None)
+                and h.expect_seconds <= cpu.borrow_seconds)
+
+
 def _gb(mib: float) -> str:
     return f"{mib / 1024:.1f} GB"
 
@@ -149,15 +158,25 @@ class Host:
     def fits(self, h) -> bool:
         return self.shortfall(h) is None
 
+    def core_room(self, h) -> int:
+        """Cores `h` may take now. A pytest lease counts declarations only; everything in
+        the queue also backs off from unmanaged load and, unless short, from the cores kept
+        for pytest. Long work never holds those, so they are only ever borrowed briefly."""
+        room = self.cores_cap - self.cores_committed
+        if getattr(h, "fast", False):
+            return room
+        room -= self.unmanaged_over
+        if not borrows(h, self.cpu):
+            room -= max(0, self.cpu.lease_reserve - self.fast_cores)
+        return room
+
     def shortfall(self, h) -> Optional[str]:
         """Why `h` does not fit now (None when it does), in words for the status page.
         A pytest lease (the fast lane) counts declarations only and may use the cores
         kept for it; everything in the queue also backs off from unmanaged load."""
         fast = getattr(h, "fast", False)
         if self.cpu and cores_of(h):
-            room = self.cores_cap - self.cores_committed
-            if not fast:
-                room -= self.unmanaged_over + max(0, self.cpu.lease_reserve - self.fast_cores)
+            room = self.core_room(h)
             if h.cores > room:
                 extra = f", {self.unmanaged_over} busy with unmanaged work" \
                     if not fast and self.unmanaged_over else ""
@@ -407,7 +426,7 @@ def project(v: View, margin_mib: int, items=None, extra_running=()) -> Dict[str,
     held_cores = sum(cores_of(h) for h in holders)
     held_mem = sum(h.mem_mib for h in holders)
     budget = [
-        (host.cores_cap - host.unmanaged_over - v.cpu.lease_reserve) if v.cpu else float("inf"),
+        (host.cores_cap - host.unmanaged_over) if v.cpu else float("inf"),
         (min(host.mem_cap, host.mem_room + host.mem_committed) - (host.mem_committed - held_mem))
         if v.mem else float("inf"),
         (v.vram_total_mib - margin_mib) if v.vram_total_mib else float("inf"),
@@ -432,7 +451,9 @@ def project(v: View, margin_mib: int, items=None, extra_running=()) -> Dict[str,
         if items is None else list(items)
     for h in queue:
         n = need(h)
-        while not blocked and any(x > f for x, f in zip(n, free)):
+        # Cores it must leave free: the pytest cores, unless it is short enough to borrow them.
+        keep = (0 if borrows(h, v.cpu) else v.cpu.lease_reserve, 0, 0) if v.cpu else (0, 0, 0)
+        while not blocked and any(x > f - k for x, f, k in zip(n, free, keep)):
             if not ends:
                 blocked = True      # waits on something with no estimate
                 break
@@ -482,8 +503,7 @@ def _make_room(v: View, first, host: "Host", vram_room: int, gone=frozenset()) -
     # Room `first` sees on each resource: VRAM, memory, cores.
     room = [vram_room,
             host.mem_room if host.mem else 10 ** 9,
-            (host.cores_cap - host.cores_committed - host.unmanaged_over
-             - max(0, host.cpu.lease_reserve - host.fast_cores)) if host.cpu else 10 ** 6]
+            host.core_room(first) if host.cpu else 10 ** 6]
     need = [first.vram_mib, first.mem_mib if host.mem else 0, cores_of(first) if host.cpu else 0]
     held = lambda j: [j.vram_mib, j.mem_mib if host.mem else 0, cores_of(j) if host.cpu else 0]
     for j in v.active:
