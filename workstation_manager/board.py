@@ -68,10 +68,12 @@ def runs_held(s: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def expect_of(s: Dict[str, Any], key: str, given: Optional[int]) -> Tuple[Optional[int], str]:
-    """The estimate the scheduler uses for `key`, and a note when it comes from past runs."""
-    past = ((s.get("broker") or {}).get("estimates") or {}).get(key)
-    if past:
-        return past, " (past runs" + (f"; --expect {_ago(given)}" if given else "") + ")"
+    """The run time the scheduler plans on for `key` (the learned upper one, P80, where
+    there is a model), and a note with the typical one and the author's guess."""
+    got = ((s.get("broker") or {}).get("estimates") or {}).get(key)
+    if got:
+        typical, plan = got
+        return plan, f" (learned: typically {_ago(typical)}" + (f"; --expect {_ago(given)}" if given else "") + ")"
     return given, ""
 
 

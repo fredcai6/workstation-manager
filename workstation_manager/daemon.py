@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Optional
 
-from . import board, cpu, interactive, page, proxy, runner, scheduler
+from . import board, cpu, estimates, interactive, page, proxy, runner, scheduler
 from .collector import collect
 from .config import Config
 from .store import ACTIVE, Store
@@ -20,7 +20,7 @@ log = logging.getLogger("workstation-manager")
 # A unit that ends this soon after starting, unasked and with no exit record, never ran.
 QUICK_EXIT_SECONDS = 30
 SAMPLE_SECONDS = 60
-PAST_SECONDS = 60                # how often past run times are re-read
+ESTIMATE_SECONDS = 600           # how often run times are re-learned from the record
 SAMPLE_KEEP_DAYS = 180
 
 
@@ -76,8 +76,9 @@ class Daemon:
         self.cgroups: dict = {}  # unit -> cgroup path
         self.lease_usage: dict = {}  # lease id -> {"peak_mib", "cpu_seconds"} seen so far
         self.sample_at = 0.0
-        self.past: dict = {}
-        self.past_at = 0.0
+        self.model: Optional[estimates.Model] = None
+        self.model_at = 0.0
+        self.learned: dict = {}         # key -> (typical, plan) seconds, this tick
         # The hold runs from the owner's last assistant request, across restarts.
         self.gate.last_interactive_at = self.store.get_kv("last_interactive_at", 0.0)
 
@@ -208,7 +209,8 @@ class Daemon:
         live = {j.unit for j in active} | {l.unit for l in leases if l.unit}
         self.cgroups = {u: p for u, p in self.cgroups.items() if u in live}
         return (scheduler.CpuView([c.cpus for c in self.cores], list(busy), self.cfg.reserve_cores,
-                                   self.cfg.lease_reserve_cores),
+                                   self.cfg.lease_reserve_cores,
+                                   self.cfg.small_lane_cores, self.cfg.small_job_seconds),
                 scheduler.MemView(total, available, self.cfg.mem_margin_mib, unrealized))
 
     def observe_pair(self) -> None:
@@ -392,10 +394,17 @@ class Daemon:
         leases = self.store.leases()
         cpu_view, mem_view = self.host_view(active, leases)
         queued = [j for j in self.store.jobs(("queued",)) if j.stop_request != "cancel"]
-        # Where earlier runs of a name finished, schedule on what they took, not --expect.
-        if now - self.past_at >= PAST_SECONDS:
-            self.past, self.past_at = self.store.past_seconds(), now
-        queued, active_v, leases = (self._past_estimates(hs) for hs in (queued, active, leases))
+        # Schedule on learned run times (the guess corrected by the record), not --expect.
+        if now - self.model_at >= ESTIMATE_SECONDS:
+            try:
+                self.model = estimates.fit(estimates.runs_from(self.store.db))
+            except Exception:
+                log.exception("learning run times failed; using --expect as given")
+                self.model = None
+            self.model_at = now
+        load = sum(self.box_load(active, leases, cpu_view)) if cpu_view else None
+        self.learned = {}
+        queued, active_v, leases = (self._learned(hs, load) for hs in (queued, active, leases))
         view = scheduler.View(
             now=time.time(),
             queued=queued,
@@ -430,9 +439,8 @@ class Daemon:
                                      "services": {n: self.svc_state[n] for n in self.cfg.services},
                                      "reserved": self.cfg.reserved(now),
                                      "waiting_on": why,
-                                     "estimates": {h.key: h.expect_seconds for h in
-                                                   list(queued) + list(active_v) + list(leases)
-                                                   if h.name in self.past and not getattr(h, "fast", False)},
+                                     "estimates": {k: list(v) for k, v in self.learned.items()},
+                                     "model": self.model.summary() if self.model else None,
                                      "projection": {k: list(v) for k, v in
                                                     scheduler.project(view, self.cfg.margin_mib).items()},
                                      "cpu": {"cores": [list(c) for c in cpu_view.cores],
@@ -444,11 +452,31 @@ class Daemon:
                                              "margin_mib": mem_view.margin_mib,
                                              "unrealized_mib": mem_view.unrealized_mib}})
 
-    def _past_estimates(self, holders):
-        """`holders` with expect_seconds from past runs of the same name, where there are any.
-        pytest keeps its own: it is the fast lane, never projected."""
-        return [dataclasses.replace(h, expect_seconds=int(self.past[h.name]))
-                if h.name in self.past and not getattr(h, "fast", False) else h for h in holders]
+    def _learned(self, holders, load):
+        """`holders` with expect_seconds set to the learned upper (P80) run time, which the
+        scheduler plans on; the typical one is kept for the status page. pytest keeps its
+        own: it is the fast lane, never projected."""
+        out = []
+        for h in holders:
+            got = None if getattr(h, "fast", False) else estimates.predict(
+                self.model, h.name, estimates.where_of(getattr(h, "argv", None) or [], h.cwd or ""),
+                h.expect_seconds, load)
+            if got:
+                self.learned[h.key] = (round(got[0]), round(got[1]))
+                h = dataclasses.replace(h, expect_seconds=max(1, round(got[1])))
+            out.append(h)
+        return out
+
+    @staticmethod
+    def box_load(active, leases, cpu_view):
+        """(Cores held by managed work, busy-ness of the rest): what a sample records, and
+        their sum is the load run times are learned against."""
+        assigned = {c for h in list(active) + [l for l in leases if l.status == "granted"]
+                    for c in (h.cpus or ())}
+        cores = cpu_view.cores if cpu_view else []
+        unmanaged = sum(b for core, b in zip(cores, cpu_view.busy if cpu_view else [])
+                        if not set(core) & assigned)
+        return sum(1 for core in cores if set(core) & assigned), unmanaged
 
     def record_sample(self, now, view, why, busy) -> None:
         """The whole box once a minute, so later reviews can see what was binding."""
@@ -457,12 +485,9 @@ class Daemon:
         self.sample_at = now
         held = [l for l in view.leases if l.status == "granted"]
         holders = list(view.active) + held
-        assigned = {c for h in holders for c in (h.cpus or ())}
-        cores = view.cpu.cores if view.cpu else []
-        unmanaged = sum(b for core, b in zip(cores, view.cpu.busy if view.cpu else [])
-                        if not set(core) & assigned)
+        cores_held, unmanaged = self.box_load(view.active, view.leases, view.cpu)
         self.store.sample(
-            now, cores_held=sum(1 for core in cores if set(core) & assigned),
+            now, cores_held=cores_held,
             unmanaged_busy=round(unmanaged, 2),
             mem_available_mib=view.mem.available_mib if view.mem else None,
             mem_declared_mib=sum(h.mem_mib for h in holders),
