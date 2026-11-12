@@ -23,10 +23,10 @@ Rules, in order:
    when idle and its room is needed by a model swap or the head of the queue.
 9. Cores and memory are resources like VRAM. Every job and lease declares physical
    cores and peak memory and starts only when both fit the declared budget (at least
-   `reserve` cores are always left to unmanaged work) and what is measured: memory
-   that running holders have declared but not yet used counts against
-   MemAvailable, and for batch jobs cores busy outside managed work count against
-   the room too. A lease has a caller waiting and skips that last check, and
+   `reserve` cores are always left to unmanaged work) and what is measured:
+   MemAvailable less the margin (memory running holders declared but have not yet
+   used is not counted again), and for batch jobs cores busy outside managed work
+   count against the room too. A lease has a caller waiting and skips that last check, and
    `lease_reserve` cores (default none) are kept for pytest: batch never takes them. A job gets whole physical cores, least busy first
    in CCD-alternating order. The rules above about the card apply to jobs that
    declare VRAM; a CPU-only job neither waits for the pair nor sends it away.
@@ -39,7 +39,9 @@ Rules, in order:
    of lower priority are stopped and requeued, newest first, until it would, if
    stopping them is enough, and no more than it needs.
    Jobs that are already stopping count as gone. Not during a reserve window.
-12. Estimates: every job and `ws run` says how long it should run (--expect). A later
+12. Estimates: every job and `ws run` says how long it should run (--expect); where
+   earlier runs of the same name finished, the daemon passes the longest of the last
+   few instead, since hand estimates run about 3x long. A later
    job that does not leave room for the first in line may still start if its estimate
    has it done before the first in line could start (project(): holders end at their
    estimates). If it runs past its
@@ -78,7 +80,7 @@ class MemView:
     total_mib: int
     available_mib: int
     margin_mib: int
-    unrealized_mib: int = 0         # declared by running holders, not yet in use
+    unrealized_mib: int = 0         # declared by running holders, not yet in use (shown, not counted)
 
 
 @dataclasses.dataclass
@@ -143,8 +145,11 @@ class Host:
             self.unmanaged_over = max(0, round(unmanaged) - self.cpu.reserve)
         if self.mem:
             self.mem_cap = self.mem.total_mib - self.mem.margin_mib
+            # Declarations must fit the budget, and the new one must fit what is free now.
+            # Memory running holders declared but have not used is not held back as well:
+            # each is capped at its declaration, and most peak near half of it.
             self.mem_room = min(self.mem_cap - self.mem_committed,
-                                self.mem.available_mib - self.mem.margin_mib - self.mem.unrealized_mib)
+                                self.mem.available_mib - self.mem.margin_mib)
 
     def fits(self, h) -> bool:
         return self.shortfall(h) is None

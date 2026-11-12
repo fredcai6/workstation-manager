@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ log = logging.getLogger("workstation-manager")
 # A unit that ends this soon after starting, unasked and with no exit record, never ran.
 QUICK_EXIT_SECONDS = 30
 SAMPLE_SECONDS = 60
+PAST_SECONDS = 60                # how often past run times are re-read
 SAMPLE_KEEP_DAYS = 180
 
 
@@ -74,6 +76,8 @@ class Daemon:
         self.cgroups: dict = {}  # unit -> cgroup path
         self.lease_usage: dict = {}  # lease id -> {"peak_mib", "cpu_seconds"} seen so far
         self.sample_at = 0.0
+        self.past: dict = {}
+        self.past_at = 0.0
         # The hold runs from the owner's last assistant request, across restarts.
         self.gate.last_interactive_at = self.store.get_kv("last_interactive_at", 0.0)
 
@@ -387,10 +391,15 @@ class Daemon:
         active = self.store.jobs(ACTIVE)
         leases = self.store.leases()
         cpu_view, mem_view = self.host_view(active, leases)
+        queued = [j for j in self.store.jobs(("queued",)) if j.stop_request != "cancel"]
+        # Where earlier runs of a name finished, schedule on what they took, not --expect.
+        if now - self.past_at >= PAST_SECONDS:
+            self.past, self.past_at = self.store.past_seconds(), now
+        queued, active_v, leases = (self._past_estimates(hs) for hs in (queued, active, leases))
         view = scheduler.View(
             now=time.time(),
-            queued=[j for j in self.store.jobs(("queued",)) if j.stop_request != "cancel"],
-            active=active,
+            queued=queued,
+            active=active_v,
             pair=self.pair,
             last_interactive_at=self.gate.last_interactive_at,
             vram_total_mib=total, vram_used_mib=used,
@@ -421,6 +430,9 @@ class Daemon:
                                      "services": {n: self.svc_state[n] for n in self.cfg.services},
                                      "reserved": self.cfg.reserved(now),
                                      "waiting_on": why,
+                                     "estimates": {h.key: h.expect_seconds for h in
+                                                   list(queued) + list(active_v) + list(leases)
+                                                   if h.name in self.past and not getattr(h, "fast", False)},
                                      "projection": {k: list(v) for k, v in
                                                     scheduler.project(view, self.cfg.margin_mib).items()},
                                      "cpu": {"cores": [list(c) for c in cpu_view.cores],
@@ -431,6 +443,12 @@ class Daemon:
                                              "available_mib": mem_view.available_mib,
                                              "margin_mib": mem_view.margin_mib,
                                              "unrealized_mib": mem_view.unrealized_mib}})
+
+    def _past_estimates(self, holders):
+        """`holders` with expect_seconds from past runs of the same name, where there are any.
+        pytest keeps its own: it is the fast lane, never projected."""
+        return [dataclasses.replace(h, expect_seconds=int(self.past[h.name]))
+                if h.name in self.past and not getattr(h, "fast", False) else h for h in holders]
 
     def record_sample(self, now, view, why, busy) -> None:
         """The whole box once a minute, so later reviews can see what was binding."""

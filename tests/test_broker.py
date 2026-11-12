@@ -387,6 +387,46 @@ class TestUnitCgroup(unittest.TestCase):
         self.assertEqual(seen, ["ws-run-7.service", "ws-run-7.scope"])
 
 
+class TestPastEstimates(Tmp):
+    def done_job(self, name, attempts, ended):
+        jid = self.store.submit(name=name, owner="t", vram_mib=0, argv=["x"], cwd="/", retries=2,
+                                grace_seconds=3, expect_seconds=7200)
+        t = ended - sum(attempts)
+        for i, took in enumerate(attempts):
+            last = i == len(attempts) - 1
+            self.store.attempt("job", jid, "done" if last else "requeued", t + took, started_at=t)
+            t += took
+        self.store.update(jid, status="done", started_at=ended - attempts[-1], ended_at=ended)
+        return jid
+
+    def test_longest_of_the_last_runs_with_attempts_summed(self):
+        self.done_job("fit", [600], 1000.0)
+        self.done_job("fit", [300, 400], 2000.0)      # requeued once: 700 s in all
+        for i in range(5):
+            self.done_job("fit", [100], 3000.0 + i)    # the five newest push the others out
+        self.done_job("other", [50], 1500.0)
+        self.assertEqual(self.store.past_seconds(), {"fit": 100.0, "other": 50.0})
+        self.assertEqual(self.store.past_seconds(last=7)["fit"], 700.0)
+
+    def test_ws_run_counts_from_grant_and_pytest_and_give_ups_do_not(self):
+        lid = self.store.request_lease("run", "spike: x.py", "t", 1, None, 1, 1024, "/", now=10.0)
+        self.store.grant_lease(lid, [0], now=100.0)
+        self.store.end_lease(lid, now=400.0)
+        gave_up = self.store.request_lease("run", "never", "t", 1, None, 1, 1024, "/", now=10.0)
+        self.store.end_lease(gave_up, now=900.0)
+        py = self.store.request_lease("pytest", "tests", "t", 1, None, 1, 1024, "/", now=10.0)
+        self.store.grant_lease(py, [0], now=20.0)
+        self.store.end_lease(py, now=80.0)
+        self.assertEqual(self.store.past_seconds(), {"spike: x.py": 300.0})
+
+    def test_status_shows_the_estimate_in_use(self):
+        from workstation_manager.board import estimate, expect_of
+        s = {"at": 1000.0, "broker": {"estimates": {"job:3": 600}}}
+        self.assertEqual(expect_of(s, "job:3", 7200), (600, " (past runs; --expect 2.0h)"))
+        self.assertEqual(expect_of(s, "job:4", 7200), (7200, ""))
+        self.assertTrue(estimate(s, "job:3", 900.0, 7200).startswith("expected 10m (past runs"))
+
+
 class TestCliEstimates(unittest.TestCase):
     def test_durations(self):
         from workstation_manager.cli import parse_duration
