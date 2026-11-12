@@ -115,7 +115,7 @@ def core_use(cores: int, busy: float) -> str:
     """How busy a run kept its cores (each has two hardware threads), and what that suggests."""
     per = busy / cores
     text = f"kept {busy:.1f} threads busy on {cores} core{'s' if cores > 1 else ''}"
-    if per < 0.6 and cores > 1:
+    if busy < cores - 0.5:          # at least half a core's worth never used
         return text + f" (about {max(1, round(busy))} would do)"
     if per < 1.2:
         return text + " (one per core: if it is compute-bound, size its pool from $WS_JOB_THREADS)"
