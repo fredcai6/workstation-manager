@@ -124,6 +124,18 @@ class TestSmallLane(unittest.TestCase):
                          status="running", cpus=[])], **self.LANE))
         self.assertEqual(acts, [])                          # 11 held
 
+    def test_small_ws_run_goes_ahead_when_memory_protects_the_head(self):
+        # 11-12: a 3-second `ws run` waited behind a 4-core job held up on cores, because
+        # starting it would have eaten into the head's memory.
+        held = dataclasses.replace(timed(8, cores=9, mem=43 * GB, expect=3600, status="running",
+                                         cpus=[]), started_at=10_000.0)
+        big = timed(1, cores=4, mem=9 * GB, expect=7200)
+        quick = dataclasses.replace(rlease(7, mem=GB), expect_seconds=3)
+        acts = run(hview(queued=[big], leases=[quick], active=[held], **self.LANE))
+        self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])
+        slow = dataclasses.replace(rlease(7, mem=GB), expect_seconds=3600)    # not small
+        self.assertEqual(run(hview(queued=[big], leases=[slow], active=[held], **self.LANE)), [])
+
     def test_projection_keeps_big_work_off_the_lane(self):
         from workstation_manager.scheduler import project
         held = timed(8, cores=9, expect=3600, status="running", cpus=[])
