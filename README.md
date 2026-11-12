@@ -123,7 +123,9 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   held core.
 - **Room.** `reserve_cores` (2) are never handed out: they are left for the desktop,
   agents, the interactive pair and the broker. `lease_reserve_cores` (2) are kept
-  for pytest: the queue never takes them. Everything in the queue (jobs and `ws run`)
+  for pytest. The queue borrows them only for work whose `--expect` is at most
+  `lease_borrow_seconds` (15 min), so short runs don't wait behind long ones, and a
+  pytest that finds them taken waits no longer than it already may. Everything in the queue (jobs and `ws run`)
   also counts cores that unmanaged work keeps busy (smoothed over about 30 s) against
   its room, so it waits rather than piling onto an overloaded box. A pytest run counts
   declarations only.
