@@ -48,9 +48,15 @@ already accounted for.
 The old `gpu` command was retired on 2026-11-11; every caller now uses `ws`. Jobs
 submitted under it before then still show as `gpu-job-N` with VRAM only.
 
-Every pinned process gets `WS_JOB_CPUS` (its logical CPUs, e.g. `0,6,12,18`) and
-`WS_JOB_CORES`. `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` are
-set to the core count unless already set. Size worker pools from `WS_JOB_CORES`.
+Every pinned process gets `WS_JOB_CPUS` (its logical CPUs, e.g. `0,6,12,18`),
+`WS_JOB_CORES` and `WS_JOB_THREADS` (both hardware threads of each core, so twice the
+cores). `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` are set to the
+core count unless already set. Size a compute-bound pool (simulation, bootstraps,
+rendering) from `WS_JOB_THREADS`; it gets the second thread of each core for nothing.
+Size a memory-bound one (csta scans and filters) from `WS_JOB_CORES`: on those, two
+workers sharing a core lost 35% against two on separate cores (benchmark 2026-10-15,
+scratch/v35/perf). `ws submit` and `ws run` print how many threads earlier runs of the
+name kept busy.
 
 ### pytest
 

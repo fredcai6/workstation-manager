@@ -194,11 +194,12 @@ def alive(pid: int, start: Optional[int]) -> bool:
 
 
 def thread_env(env: dict, cores: int, cpus: Sequence[int]) -> dict:
-    """What a pinned process is told: its CPUs and core count, and thread-pool sizes
-    matching its cores unless the caller set them."""
+    """What a pinned process is told: its CPUs, core count and hardware threads (both of
+    each core's), and thread-pool sizes matching its cores unless the caller set them."""
     env = dict(env)
     env["WS_JOB_CPUS"] = format_cpulist(cpus)
     env["WS_JOB_CORES"] = str(cores)
+    env["WS_JOB_THREADS"] = str(len(cpus))
     for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
         env.setdefault(k, str(cores))
     return env

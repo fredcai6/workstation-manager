@@ -95,14 +95,31 @@ def past_runs(store, name: str) -> str:
     peaks = sorted(r["peak_mib"] for r in store.db.execute(
         "SELECT peak_mib FROM attempts WHERE name=? AND outcome IN ('done','ended')"
         " AND peak_mib IS NOT NULL ORDER BY ended_at DESC LIMIT 5", (name,)).fetchall())
-    if not took and not peaks:
+    use = store.db.execute(
+        "SELECT cores, cpu_seconds / (ended_at - started_at) AS busy FROM attempts WHERE name=?"
+        " AND outcome IN ('done','ended') AND cores > 0 AND cpu_seconds IS NOT NULL"
+        " AND ended_at - started_at > 60 ORDER BY ended_at DESC LIMIT 5", (name,)).fetchall()
+    if not took and not peaks and not use:
         return ""
     bits = []
     if took:
         bits.append(f"took {_ago_text(took[0])}" + (f"-{_ago_text(took[-1])}" if len(took) > 1 else ""))
     if peaks:
         bits.append(f"peak {peaks[0] / 1024:.1f}" + (f"-{peaks[-1] / 1024:.1f}" if len(peaks) > 1 else "") + " GB")
-    return f"earlier runs of {name} ({max(len(took), len(peaks))}): " + ", ".join(bits)
+    if use:
+        bits.append(core_use(use[0]["cores"], max(r["busy"] for r in use)))
+    return f"earlier runs of {name} ({max(len(took), len(peaks), len(use))}): " + ", ".join(bits)
+
+
+def core_use(cores: int, busy: float) -> str:
+    """How busy a run kept its cores (each has two hardware threads), and what that suggests."""
+    per = busy / cores
+    text = f"kept {busy:.1f} threads busy on {cores} core{'s' if cores > 1 else ''}"
+    if per < 0.6 and cores > 1:
+        return text + f" (about {max(1, round(busy))} would do)"
+    if per < 1.2:
+        return text + " (one per core: if it is compute-bound, size its pool from $WS_JOB_THREADS)"
+    return text
 
 
 def _store(cfg):
