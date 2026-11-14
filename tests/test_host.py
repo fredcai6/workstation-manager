@@ -320,6 +320,32 @@ class TestWhyWaiting(unittest.TestCase):
         self.assertEqual(acts, [])
         self.assertEqual(why["job:2"], "held back for #1 (first in line)")
 
+    def _ahead_of_big_first(self, running_expect, later_expect=None):
+        """Budget 52 GB: #3 runs on 30 GB, #1 (30 GB) is first, #2 (22 GB) fits only beside #3."""
+        running = dataclasses.replace(cjob(3, mem=30 * GB, status="running", cpus=[0, 12]),
+                                      started_at=10_000.0, expect_seconds=running_expect)
+        later = dataclasses.replace(cjob(2, mem=22 * GB), expect_seconds=later_expect)
+        return self.why(hview(queued=[cjob(1, mem=30 * GB), later], active=[running]))
+
+    def test_a_later_job_may_start_when_running_work_ends_before_the_first_could_start(self):
+        # #3 is gone when #1 starts, and #1 (30) + #2 (22) = 52 fit the budget together.
+        acts, why = self._ahead_of_big_first(running_expect=3600)
+        self.assertEqual(acts, [("start_job", 2, [6, 18])])
+        self.assertNotIn("job:2", why)
+
+    def test_running_work_with_no_estimate_still_counts_against_the_first(self):
+        acts, why = self._ahead_of_big_first(running_expect=None)
+        self.assertEqual(acts, [])
+        self.assertEqual(why["job:2"], "held back for #1 (first in line)")
+
+    def test_a_later_job_too_big_to_share_with_the_first_stays_held_back(self):
+        running = dataclasses.replace(cjob(3, mem=25 * GB, status="running", cpus=[0, 12]),
+                                      started_at=10_000.0, expect_seconds=3600)
+        acts, why = self.why(hview(queued=[cjob(1, mem=30 * GB), cjob(2, mem=26 * GB)],
+                                   active=[running]))
+        self.assertEqual(acts, [])
+        self.assertEqual(why["job:2"], "held back for #1 (first in line)")
+
     def test_started_jobs_and_granted_leases_have_no_reason(self):
         acts, why = self.why(hview(queued=[cjob(1)], leases=[lease(7)]))
         self.assertEqual(len(acts), 2)

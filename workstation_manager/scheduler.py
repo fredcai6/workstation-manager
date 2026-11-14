@@ -42,7 +42,8 @@ Rules, in order:
 12. Estimates: every job and `ws run` says how long it should run (--expect); the daemon
    passes the learned upper (P80) run time instead (estimates.py: the guess corrected by
    the record, by where and what the run is and how loaded the box is). A later
-   job that does not leave room for the first in line may still start if its estimate
+   job that does not leave room for the first in line (in memory, running holders that
+   end before the first could start do not count against it) may still start if its estimate
    has it done before the first in line could start (project(): holders end at their
    estimates). If it runs past its
    estimate while the first in line waits, it is stopped and requeued, newest first,
@@ -201,15 +202,18 @@ class Host:
             return f"memory: needs {_gb(h.mem_mib)}, {_gb(max(0, self.mem_room))} free"
         return None
 
-    def leaves_room_for(self, h, head) -> bool:
+    def leaves_room_for(self, h, head, ended_mem_mib: int = 0) -> bool:
         """Whether starting `h` still lets `head` fit once running work is gone. Small
-        work that fits in the small lane takes nothing a bigger `head` could use."""
+        work that fits in the small lane takes nothing a bigger `head` could use.
+        `ended_mem_mib` is the memory of running holders expected to end before `head`
+        could start: they are not there when it does, so they do not count against it."""
         lane_only = self.cpu and is_small(h, self.cpu) and not is_small(head, self.cpu) \
             and cores_of(h) <= self.lane_free()
         if self.cpu and cores_of(h) and not lane_only and \
                 self.cores_cap - (self.cores_committed + cores_of(h)) < cores_of(head):
             return False
-        if self.mem and h.mem_mib and self.mem_cap - (self.mem_committed + h.mem_mib) < head.mem_mib:
+        if self.mem and h.mem_mib \
+                and self.mem_cap - (self.mem_committed - ended_mem_mib + h.mem_mib) < head.mem_mib:
             return False
         return True
 
@@ -347,14 +351,14 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
         first = waiting[0]
         backfill = False
         if job is not first:
+            if first.key not in shadows:
+                shadows[first.key] = project(v, margin_mib, [first], started_now)[first.key][0]
+            shadow = shadows[first.key]
             if (job.vram_mib and cap - (committed + job.vram_mib) < first.vram_mib) \
-                    or not host.leaves_room_for(job, first):
+                    or not host.leaves_room_for(job, first, _ended_mem(v, shadow)):
                 # It may still go ahead if its estimate has it done before the first in
                 # line could start anyway. A job, which can be stopped if it runs over, or
                 # small work (a `ws run` too): if it runs over, the first waits at most a little.
-                if first.key not in shadows:
-                    shadows[first.key] = project(v, margin_mib, [first], started_now)[first.key][0]
-                shadow = shadows[first.key]
                 if not ((isinstance(job, Job) or is_small(job, v.cpu)) and job.expect_seconds
                         and shadow is not None
                         and v.now + job.expect_seconds <= shadow):
@@ -409,6 +413,16 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
     elif v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
         actions.append(("start_pair", want))
     return actions
+
+
+def _ended_mem(v: View, start: Optional[float]) -> int:
+    """Memory of running holders expected to end by `start` (when the first in line could
+    start): they are gone by then, so a job started now need not leave room beside them."""
+    if start is None or not v.mem:
+        return 0
+    holders = list(v.active) + [l for l in v.leases if l.status == "granted" and not l.fast]
+    return sum(h.mem_mib for h in holders
+               if (end := expected_end(h, v.now)[0]) is not None and end <= start)
 
 
 def queue_order(items):
