@@ -1,5 +1,5 @@
 [Unit]
-Description=Workstation manager broker: queue and leases for cores, memory and the GPU; the :8005/:8006 front door
+Description=Workstation manager broker: one job queue for cores, memory and the GPU; the :8005/:8006 front door
 
 [Service]
 # `ws` on this path is a symlink to the repo's ./ws.

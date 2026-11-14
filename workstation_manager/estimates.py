@@ -207,29 +207,27 @@ def memory_runs_from(db) -> List[MemRun]:
     have stopped part way, short of a full run's peak, so they are left out: the charge
     is centred on the usual peak, and runs that died early would pull it down."""
     rows = db.execute(
-        "SELECT a.name, a.mem_mib, a.peak_mib, j.argv, j.cwd, l.cwd FROM attempts a"
+        "SELECT a.name, a.mem_mib, a.peak_mib, j.argv, j.cwd FROM attempts a"
         " LEFT JOIN jobs j ON a.kind='job' AND j.id=a.ref"
-        " LEFT JOIN leases l ON a.kind='lease' AND l.id=a.ref"
         " WHERE a.peak_mib > 0 AND a.mem_mib > 0 AND a.outcome IN ('done','ended')"
         " AND a.ended_at - a.started_at > 60").fetchall()
-    return [MemRun(name, where_of(json.loads(argv) if argv else [], jcwd or lcwd or ""), mem, peak)
-            for name, mem, peak, argv, jcwd, lcwd in rows]
+    return [MemRun(name, where_of(json.loads(argv) if argv else [], cwd or ""), mem, peak)
+            for name, mem, peak, argv, cwd in rows]
 
 
 def runs_from(db, samples: bool = True) -> List[Run]:
-    """Finished runs from the broker's database: jobs (attempts summed, so a resumed run
-    is one run) and `ws run` leases (grant to end). Failed, cancelled and given-up runs
-    say nothing about how long a full run takes, so they are left out."""
+    """Finished runs from the broker's database: batch jobs (attempts summed, so a resumed
+    run is one run) and `ws run` commands. Failed and cancelled runs say nothing about how
+    long a full run takes, so they are left out, and so is a `ws run` whose process went
+    away without an exit code (`ended`)."""
     rows = db.execute(
         "SELECT j.name, j.argv, j.cwd, j.expect_seconds AS expect,"
         " COALESCE((SELECT SUM(a.ended_at - a.started_at) FROM attempts a WHERE a.kind='job'"
         "  AND a.ref=j.id AND a.started_at IS NOT NULL), j.ended_at - j.started_at) AS took,"
         " COALESCE((SELECT MIN(a.started_at) FROM attempts a WHERE a.kind='job' AND a.ref=j.id),"
         "  j.started_at) AS t0, j.ended_at AS t1"
-        " FROM jobs j WHERE j.status='done' AND j.started_at IS NOT NULL AND j.expect_seconds > 0"
-        " UNION ALL SELECT name, NULL, cwd, expect_seconds, ended_at - granted_at, granted_at, ended_at"
-        " FROM leases WHERE kind='run' AND status='done' AND granted_at IS NOT NULL"
-        " AND expect_seconds > 0").fetchall()
+        " FROM jobs j WHERE j.kind IN ('batch','run') AND j.status='done'"
+        " AND j.started_at IS NOT NULL AND j.expect_seconds > 0").fetchall()
     out = []
     for name, argv, cwd, expect, took, t0, t1 in rows:
         load = None

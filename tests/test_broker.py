@@ -407,8 +407,8 @@ class TestQueueOrder(unittest.TestCase):
 
 class TestUnitCgroup(unittest.TestCase):
     def test_bare_name_finds_a_ws_run_scope(self):
-        # `ws run` leases record "ws-run-N"; the unit is ws-run-N.scope. Reading it as a
-        # service found no cgroup, so the lease's memory read as its wrapper's 20 MB.
+        # A `ws run` records its scope as "ws-run-N"; the unit is ws-run-N.scope. Reading it
+        # as a service found no cgroup, so its memory read as its wrapper's 20 MB.
         from workstation_manager import cpu
         seen = []
 
@@ -433,19 +433,22 @@ class TestLearnedEstimates(Tmp):
         self.store.update(jid, status="done", started_at=ended - attempts[-1], ended_at=ended)
         return jid
 
-    def test_runs_sum_attempts_and_skip_give_ups_and_pytest(self):
+    def test_runs_sum_attempts_and_skip_give_ups_failures_and_pytest(self):
         from workstation_manager.estimates import runs_from
         self.done_job("fit", [300, 400], 2000.0)            # requeued once: one 700 s run
-        lid = self.store.request_lease("run", "spike: x.py", "t", 1, None, 1, 1024, "/s", now=10.0,
-                                       expect_seconds=600)
-        self.store.grant_lease(lid, [0], now=100.0)
-        self.store.end_lease(lid, now=400.0)
-        gave_up = self.store.request_lease("run", "never", "t", 1, None, 1, 1024, "/", now=10.0,
-                                           expect_seconds=600)
-        self.store.end_lease(gave_up, now=900.0)
-        py = self.store.request_lease("pytest", "tests", "t", 1, None, 1, 1024, "/", now=10.0)
-        self.store.grant_lease(py, [0], now=20.0)
-        self.store.end_lease(py, now=80.0)
+        run = lambda name, cwd="/s": self.store.request("run", name, "t", 1, None, 1, 1024, cwd, now=10.0,
+                                                        expect_seconds=600)
+        lid = run("spike: x.py")
+        self.store.grant(lid, [0], now=100.0)
+        self.store.finish(lid, 0, now=400.0)
+        for name, code in (("broke", 1), ("lost", None)):   # failed; process gone, no exit code
+            i = run(name)
+            self.store.grant(i, [0], now=100.0)
+            self.store.finish(i, code, now=200.0)
+        self.store.finish(run("never", "/"), None, now=900.0)
+        py = self.store.request("pytest", "tests", "t", 1, None, 1, 1024, "/", now=10.0)
+        self.store.grant(py, [0], now=20.0)
+        self.store.finish(py, 0, now=80.0)
         got = {(r.name, r.where, r.expect, r.took) for r in runs_from(self.store.db)}
         self.assertEqual(got, {("fit", "/x", 7200, 700.0), ("spike: x.py", "/s", 600, 300.0)})
 
@@ -485,26 +488,46 @@ class TestLearnedEstimates(Tmp):
         self.assertTrue(estimate(s, "job:3", 900.0, 7200).startswith("expected 10m (learned"))
 
 
-class TestLeaseRecord(Tmp):
-    def test_a_lease_its_command_ended_is_recorded_with_its_usage(self):
-        # 11-12: a `ws run` that finished normally marked its own lease done, and the
-        # broker never recorded it: no peaks or CPU time for any `ws run`.
+class TestForegroundRecord(Tmp):
+    def test_a_run_its_command_ended_is_recorded_with_its_exit_and_usage(self):
         import os as _os
+        import time as _time
         from workstation_manager import cpu
-        lid = self.store.request_lease("run", "spike: x.py", "t", _os.getpid(), None, 1, 2048, "/s",
-                                       now=10.0, expect_seconds=600)
-        self.store.grant_lease(lid, [0], now=100.0)
+        now = _time.time()
+        lid = self.store.request("run", "spike: x.py", "t", _os.getpid(), None, 1, 2048, "/s",
+                                 now=now - 400, expect_seconds=600)
+        self.store.grant(lid, [0], now=now - 300)
         d = daemon.Daemon(self.cfg, store=self.store)
         with mock.patch.object(cpu, "alive", return_value=True):
-            d.reconcile_leases()                      # seen while granted
-        d.lease_usage[lid] = {"peak_mib": 900, "cpu_seconds": 250.0}
-        self.store.end_lease(lid, now=400.0)          # the command ends it itself
-        d.reconcile_leases()
-        rows = self.store.attempts("lease", lid)
-        self.assertEqual([(r["name"], r["outcome"], r["ended_at"], r["peak_mib"]) for r in rows],
-                         [("spike: x.py", "ended", 400.0, 900)])
-        d.reconcile_leases()                          # once only
-        self.assertEqual(len(self.store.attempts("lease", lid)), 1)
+            d.reconcile_foreground()                  # running: nothing recorded yet
+        self.assertEqual(self.store.attempts("job", lid), [])
+        d.fg_usage[lid] = {"peak_mib": 900, "cpu_seconds": 250.0}
+        self.store.finish(lid, 3, now=now)            # the command ends it itself, exit 3
+        d.reconcile_foreground()
+        rows = self.store.attempts("job", lid)
+        self.assertEqual([(r["name"], r["outcome"], r["exit_code"], r["ended_at"], r["peak_mib"]) for r in rows],
+                         [("spike: x.py", "failed", 3, now, 900)])
+        d.reconcile_foreground()                      # once only
+        self.assertEqual(len(self.store.attempts("job", lid)), 1)
+
+    def test_a_run_whose_process_is_gone_ends_with_no_exit_code(self):
+        import time as _time
+        from workstation_manager import cpu
+        lid = self.store.request("run", "x", "t", 999_999, None, 1, 2048, "/", now=_time.time())
+        self.store.grant(lid, [0])
+        with mock.patch.object(cpu, "alive", return_value=False):
+            daemon.Daemon(self.cfg, store=self.store).reconcile_foreground()
+        self.assertEqual(self.store.get(lid).status, "ended")
+        self.assertEqual([r["outcome"] for r in self.store.attempts("job", lid)], ["ended"])
+
+    def test_a_grant_starts_no_unit_and_a_run_is_never_stopped(self):
+        from workstation_manager import runner
+        lid = self.store.request("run", "x", "t", 1, None, 1, 2048, "/")
+        d = daemon.Daemon(self.cfg, store=self.store)
+        with mock.patch.object(runner, "start") as start:
+            d.apply([("start_job", lid, [0, 12])])
+        start.assert_not_called()
+        self.assertEqual((self.store.get(lid).status, self.store.get(lid).cpus), ("running", [0, 12]))
 
 
 class TestMemoryCharge(unittest.TestCase):

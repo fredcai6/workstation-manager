@@ -1,9 +1,8 @@
 # workstation-manager
 
 Shares this workstation between the work on it. A broker hands out physical CPU
-cores, memory and the AMD GPU: batch jobs wait in a queue, foreground work (pytest
-runs, `ws run`) takes a lease, and each runs pinned to its own cores with its memory
-declared. The GPU also has an always-wanted interactive tier (a local LLM and a
+cores, memory and the AMD GPU to jobs, and each runs pinned to its own cores with its
+memory declared. The GPU also has an always-wanted interactive tier (a local LLM and a
 speech-recognition server): the broker lends the card to batch when the tier is idle
 and fronts the LLM/ASR ports so callers wait instead of failing while it is lent
 out. Python standard library only; Linux, AMDGPU, Docker and systemd user units.
@@ -17,14 +16,14 @@ state reached 750-900, and pinning to SMT siblings cost 35% (2026-10-15 sweep,
 ## Using it
 
 ```
-ws status [--json]                    card, cores, memory, leases, queue
+ws status [--json]                    card, cores, memory, running, queue, finished
 ws submit --cores 4 --mem 8G --expect 2h [--vram 18G] [--priority N] --name NAME -- CMD...
                                       queue a job
 ws run --cores 4 --mem 8G --expect 20m [--priority N] -- CMD...
                                       wait in the same queue, then run here, in the foreground
 ws queue [--json]                     broker state only
-ws cancel ID
-ws log ID                             path of a job's log
+ws cancel ID                          a batch job
+ws log ID                             path of a batch job's log
 ws take / ws release                  operator override: stop everything / resume
 ```
 
@@ -48,8 +47,24 @@ retried. `--vram` (default none) makes it a GPU job.
 
 A submitted job runs from the directory it was submitted in, with the submitter's
 environment. `ws run` runs the command directly, with its terminal, and returns its
-exit code. Inside a job or a lease, `ws run` just runs the command: that work is
-already accounted for.
+exit code. Inside a job, `ws run` just runs the command: that work is already
+accounted for.
+
+### One kind of job, three ways to run it
+
+Every piece of work is a job, with one id sequence, one set of states and one history:
+
+| kind | started by | run by | stopped, requeued, retried? |
+|---|---|---|---|
+| `batch` | `ws submit` | the broker, as a systemd unit, logging to `ws log ID` | yes |
+| `run` | `ws run` | its caller's own process, in its terminal | no |
+| `pytest` | every pytest run (below) | its caller's own process | no |
+
+The broker starts a batch job, so it can stop it to make room and run it again; it
+only grants a `ws run` or pytest run its cores and watches its process, so it never
+stops one. A foreground job ends `done` or `failed` by the exit code its caller
+reports, or `ended` when its process went away without one. All three show on the
+page and in `ws status`: running, waiting, finished.
 
 The old `gpu` command was retired on 2026-11-11; every caller now uses `ws`. Jobs
 submitted under it before then still show as `gpu-job-N` with VRAM only.
@@ -66,20 +81,20 @@ name kept busy.
 
 ### pytest
 
-Every pytest run on the machine takes a lease. `PYTEST_PLUGINS=ws_pytest`, with
+Every pytest run on the machine is a job of kind pytest. `PYTEST_PLUGINS=ws_pytest`, with
 `pytest_hook/` on `PYTHONPATH` (both set in `~/.bashrc`), loads
 `pytest_hook/ws_pytest.py` in every venv. Before collection, the run waits for its
-cores and pins itself to them, and its xdist workers inherit them. The lease ends
-with the run.
+cores and pins itself to them, and its xdist workers inherit them. The job ends with
+the run, with pytest's exit status.
 
 - It asks for 1 core and 2 GB. `-n N` asks for N cores, and `-n auto` asks for
   `pytest_auto_cores` (4) and runs that many workers. `WS_PYTEST_CORES=3` and
   `WS_PYTEST_MEM=8G` override.
 - A run that waits prints one line saying so; `ws status` shows who holds the cores.
-  After `lease_wait_seconds` (15 min) it runs anyway, unpinned, and says so. When
+  After `pytest_wait_seconds` (15 min) it runs anyway, unpinned, and says so. When
   the broker is not running it runs unpinned at once.
-- No lease is taken for `--collect-only`, `--help`, xdist workers, runs inside a
-  job or lease, or with `WS_PYTEST=0` or `-p no:ws_pytest`. Memory is declared for
+- Nothing is queued for `--collect-only`, `--help`, xdist workers, runs inside a
+  job, or with `WS_PYTEST=0` or `-p no:ws_pytest`. Memory is declared for
   accounting only.
 
 ### The job contract
@@ -104,24 +119,25 @@ with the run.
 
 The status page shows the card and who holds its VRAM, each core and who holds it
 (or how busy unmanaged work keeps it), memory by holder and the room left for new
-work, the leases, each running job's priority, progress and last output line, the
-queue in the order it will start (with each job's priority and what is holding it
-up: cores, memory, VRAM, or the job ahead of it), finished jobs and the last day of
-events. `ws status` shows the same. The broker rewrites the page every 30 s into each
+work, each running job's priority, progress and last output line (a `ws run`: where
+it runs), pytest runs, the queue in the order it will start (with each job's priority
+and what is holding it up: cores, memory, VRAM, or the job ahead of it), finished
+batch jobs and `ws run` commands with how they ended, a count of the last day's
+pytest runs by outcome, and the last day of events. `ws status` shows the same. The broker rewrites the page every 30 s into each
 directory in `page_dirs`.
 
 ### What gets recorded
 
-`broker.db` in the state dir keeps, besides jobs, leases and events:
+`broker.db` in the state dir keeps, besides jobs and events:
 
-- `attempts`: one row per run of a job (each attempt) and per lease, with what it
+- `attempts`: one row per run of a job (each attempt of a batch job), with what it
   declared (cores, memory, VRAM, priority), its outcome, and what it used: CPU
   seconds and peak memory, its containers included. A job's end also gets an event
   such as `used 1.6 of 2 cores, peak 10.2 of 16.0 GB over 2.0h`. Use it to size
   `--mem` and `--cores`.
 - `samples`: the whole box once a minute (cores held, unmanaged load, memory
   available, declared and declared-but-unused, memory pressure, VRAM, the pair, queue
-  length) and what held up each waiting job and lease. Kept 180 days.
+  length) and what held up each waiting job. Kept 180 days.
 
 A unit that ends within 30 s of starting with no exit record (its directory was
 removed, say) counts as a failed attempt, not an interruption, so it is retried
@@ -140,7 +156,7 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   it is left for the desktop, agents, the interactive pair and the broker. pytest runs
   share it: they are rare and short, so a few minutes of two things on one core costs
   little. A pytest counts declarations only, so it starts at once unless managed work
-  holds every core. (`lease_reserve_cores`, default 0, would keep cores for pytest
+  holds every core. (`pytest_reserve_cores`, default 0, would keep cores for pytest
   alone.) The queue also counts cores that unmanaged work keeps busy (smoothed over
   about 30 s) against its room, beyond the reserve, so it waits rather than piling onto
   an overloaded box.
@@ -183,8 +199,8 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   head only if the head would still fit once running work is gone, in every
   resource the later job uses. A CPU-only job neither waits for the pair nor sends
   it away.
-- **Wake-ups.** A new lease or job pokes the broker's socket (`wake.sock` in the
-  state dir), so a lease is granted on the next tick, about a second later, instead
+- **Wake-ups.** A new job pokes the broker's socket (`wake.sock` in the
+  state dir), so a `ws run` or pytest run starts on the next tick, about a second later, instead
   of after the 5 s wait.
 
 ## How the card is shared
@@ -249,7 +265,7 @@ biasing vocabulary (~1.8k tokens for 4,000 characters); the worst case measured 
 | `workstation_manager/scheduler.py` | the scheduling rules, as one pure function |
 | `workstation_manager/daemon.py` | the broker loop (`ws daemon`) |
 | `workstation_manager/cpu.py` | core topology, the load meter, memory, pinning |
-| `workstation_manager/lease.py` | leases: what `ws run` and the pytest hook wait for |
+| `workstation_manager/foreground.py` | foreground jobs: what `ws run` and the pytest hook wait for |
 | `pytest_hook/ws_pytest.py` | the pytest plugin |
 | `workstation_manager/proxy.py` | the :8005/:8006 front door |
 | `workstation_manager/runner.py` | jobs as transient systemd user units (`ws-job-N`) |
@@ -272,7 +288,7 @@ loginctl enable-linger "$USER"     # so the broker and jobs run without a login
 # so AllowedCPUs= holds each job to its cores (takes effect at the next boot):
 sudo mkdir -p /etc/systemd/system/user@.service.d
 printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate-cpuset.conf
-# every pytest run takes a lease (in ~/.bashrc, after the interactive guard):
+# every pytest run waits for its cores (in ~/.bashrc, after the interactive guard):
 export PYTHONPATH="$HOME/projects/workstation-manager/pytest_hook${PYTHONPATH:+:$PYTHONPATH}"
 export PYTEST_PLUGINS=ws_pytest
 ```

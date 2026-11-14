@@ -74,7 +74,7 @@ class Daemon:
         self.meter = cpu.Meter(self.cores)
         self.wake = threading.Event()
         self.cgroups: dict = {}  # unit -> cgroup path
-        self.lease_usage: dict = {}  # lease id -> {"peak_mib", "cpu_seconds"} seen so far
+        self.fg_usage: dict = {}     # foreground job id -> {"peak_mib", "cpu_seconds"} seen so far
         self.sample_at = 0.0
         self.model: Optional[estimates.Model] = None
         self.model_at = 0.0
@@ -84,13 +84,12 @@ class Daemon:
         self.pressure_cgroup = cpu.user_manager_cgroup()
         self.mem_used: dict = {}        # key -> MiB a running holder uses now
         self.charged: dict = {}         # key -> MiB the scheduler counts for it, this tick
-        self.seen_leases: dict = {}     # id -> granted lease, to record it once it ends
         # The hold runs from the owner's last assistant request, across restarts.
         self.gate.last_interactive_at = self.store.get_kv("last_interactive_at", 0.0)
 
     # -- reconcile --------------------------------------------------------
     def reconcile_jobs(self) -> None:
-        for job in self.store.jobs(ACTIVE):
+        for job in self.store.jobs(ACTIVE, ("batch",)):
             if runner.is_active(job):
                 continue
             res = runner.take_result(self.cfg, job.id)
@@ -142,7 +141,7 @@ class Daemon:
                                   failures=job.failures + 1, exit_code=res["exit_code"])
                 self.store.event(job.id, f"exit {res['exit_code']}; failed")
             self._record_attempt(job, res, now)
-        for job in self.store.jobs(("queued",)):
+        for job in self.store.jobs(("queued",), ("batch",)):
             if job.stop_request == "cancel":
                 self.store.update(job.id, status="cancelled", ended_at=time.time(), stop_request=None)
                 self.store.event(job.id, "cancelled while queued")
@@ -166,21 +165,14 @@ class Daemon:
         if text:
             self.store.event(before.id, text)
 
-    def reconcile_leases(self) -> None:
-        current = self.store.leases()
-        for lease in current:
-            if not cpu.alive(lease.pid, lease.pid_start):
-                self.store.end_lease(lease.id)
-                self._record_lease(lease)
-        # A lease its command ended itself (the usual way a `ws run` or pytest finishes)
-        # is gone from the list: record it too, with what it used.
-        live = {l.id for l in current}
-        for lid, lease in list(self.seen_leases.items()):
-            if lid not in live:
-                self._record_lease(lease, ended=(self.store.lease(lid) or lease).ended_at)
-        self.seen_leases = {l.id: l for l in current if l.status == "granted"
-                            and cpu.alive(l.pid, l.pid_start)}
-        self.store.prune_leases(time.time() - 86400)
+    def reconcile_foreground(self) -> None:
+        """End foreground work whose process is gone without saying how it ended, and
+        record every foreground job that has ended, with what it used."""
+        for job in self.store.jobs(("queued", "running"), ("run", "pytest")):
+            if not cpu.alive(job.pid, job.pid_start):
+                self.store.finish(job.id, None)
+        for job in self.store.unrecorded(time.time() - 86400):
+            self._record_foreground(job)
 
     def _cgroup(self, unit: str):
         if unit not in self.cgroups:
@@ -190,7 +182,7 @@ class Daemon:
             self.cgroups[unit] = path
         return self.cgroups[unit]
 
-    def host_view(self, active, leases):
+    def host_view(self, active):
         """The cores and memory as the scheduler sees them, and memory that holders have
         declared but not yet used (it is about to leave MemAvailable)."""
         busy = self.meter.sample()
@@ -198,30 +190,28 @@ class Daemon:
         unrealized = 0
         self.mem_used = {}
         for j in active:
-            if j.mem_mib:
+            if j.in_terminal:
+                cg = self._cgroup(j.scope) if j.scope else None
+                used = cpu.memory_current_mib(cg) if cg else None
+                if used is None:
+                    used = cpu.rss_mib(j.pid)
+                unrealized += max(0, j.mem_mib - used)
+                self.mem_used[j.key] = used or 0
+                # What it has used, kept while it runs: its scope is gone once it ends.
+                cpu_s, peak = cpu.cgroup_usage(cg) if cg else (None, None)
+                u = self.fg_usage.setdefault(j.id, {})
+                u["peak_mib"] = max(u.get("peak_mib") or 0, peak or used)
+                if cpu_s is not None:
+                    u["cpu_seconds"] = round(cpu_s, 1)
+            elif j.mem_mib:
                 used = (cpu.memory_current_mib(self._cgroup(j.unit)) or 0) \
                     + cpu.container_memory_mib(runner.label(j))
                 unrealized += max(0, j.mem_mib - used)
                 self.mem_used[j.key] = used
-        for l in leases:
-            if l.status != "granted":
-                continue
-            cg = self._cgroup(l.unit) if l.unit else None
-            used = cpu.memory_current_mib(cg) if cg else None
-            if used is None:
-                used = cpu.rss_mib(l.pid)
-            unrealized += max(0, l.mem_mib - used)
-            self.mem_used[l.key] = used or 0
-            # What it has used, kept while it runs: its scope is gone once it ends.
-            cpu_s, peak = cpu.cgroup_usage(cg) if cg else (None, None)
-            u = self.lease_usage.setdefault(l.id, {})
-            u["peak_mib"] = max(u.get("peak_mib") or 0, peak or used)
-            if cpu_s is not None:
-                u["cpu_seconds"] = round(cpu_s, 1)
-        live = {j.unit for j in active} | {l.unit for l in leases if l.unit}
+        live = {j.unit for j in active if j.unit}
         self.cgroups = {u: p for u, p in self.cgroups.items() if u in live}
         return (scheduler.CpuView([c.cpus for c in self.cores], list(busy), self.cfg.reserve_cores,
-                                   self.cfg.lease_reserve_cores,
+                                   self.cfg.pytest_reserve_cores,
                                    self.cfg.small_lane_cores, self.cfg.small_job_seconds),
                 scheduler.MemView(total, available, self.cfg.mem_margin_mib, unrealized,
                                   *cpu.memory_pressure(self.pressure_cgroup),
@@ -351,10 +341,11 @@ class Daemon:
     def apply(self, actions) -> None:
         for act in actions:
             kind = act[0]
-            if kind == "grant_lease":
-                self.store.grant_lease(act[1], act[2])
-            elif kind == "start_job":
+            if kind == "start_job":
                 job = self.store.get(act[1])
+                if job.in_terminal:         # its caller is waiting for the grant
+                    self.store.grant(job.id, act[2] if len(act) > 2 and act[2] else [])
+                    continue
                 backfill = len(act) > 3 and act[3] == "backfill"
                 if not os.path.isdir(job.cwd):
                     self.store.update(job.id, status="failed", ended_at=time.time())
@@ -392,11 +383,11 @@ class Daemon:
     # -- loop -------------------------------------------------------------
     def tick(self) -> None:
         self.reconcile_jobs()
-        self.reconcile_leases()
+        self.reconcile_foreground()
         self.observe_pair()
         self.observe_services()
         # Cancels of running jobs go out before scheduling.
-        for job in self.store.jobs(("running",)):
+        for job in self.store.jobs(("running",), ("batch",)):
             if job.stop_request == "cancel":
                 self.store.update(job.id, status="stopping")
                 runner.stop(job)
@@ -405,8 +396,7 @@ class Daemon:
         want = self.wanted_model(now)
         self.store.set_kv("last_interactive_at", self.gate.last_interactive_at)
         active = self.store.jobs(ACTIVE)
-        leases = self.store.leases()
-        cpu_view, mem_view = self.host_view(active, leases)
+        cpu_view, mem_view = self.host_view(active)
         queued = [j for j in self.store.jobs(("queued",)) if j.stop_request != "cancel"]
         # Schedule on learned run times (the guess corrected by the record), not --expect.
         if now - self.model_at >= ESTIMATE_SECONDS:
@@ -421,9 +411,9 @@ class Daemon:
                 log.exception("learning memory peaks failed; counting declarations")
                 self.mem_model = None
             self.model_at = now
-        load = sum(self.box_load(active, leases, cpu_view)) if cpu_view else None
+        load = sum(self.box_load(active, cpu_view)) if cpu_view else None
         self.learned, self.charged = {}, {}
-        queued, active_v, leases = (self._learned(hs, load) for hs in (queued, active, leases))
+        queued, active_v = (self._learned(hs, load) for hs in (queued, active))
         view = scheduler.View(
             now=time.time(),
             queued=queued,
@@ -436,7 +426,7 @@ class Daemon:
             loaded=self.gate.loaded, want=want,
             services=self.services_view(now),
             reserved=self.cfg.reserved(now),
-            cpu=cpu_view, mem=mem_view, leases=leases,
+            cpu=cpu_view, mem=mem_view,
         )
         pair_busy = self.pair_action is not None and self.pair_action.is_alive()
         vram = {m.name: m.vram_mib for m in self.cfg.model_table().values()}
@@ -466,22 +456,21 @@ class Daemon:
                                      "cpu": {"cores": [list(c) for c in cpu_view.cores],
                                              "busy": [round(b, 3) for b in cpu_view.busy],
                                              "reserve": cpu_view.reserve,
-                                             "lease_reserve": cpu_view.lease_reserve},
+                                             "pytest_reserve": cpu_view.pytest_reserve},
                                      "mem": {"total_mib": mem_view.total_mib,
                                              "available_mib": mem_view.available_mib,
                                              "margin_mib": mem_view.margin_mib,
                                              "unrealized_mib": mem_view.unrealized_mib}})
 
-    def _record_lease(self, lease, ended=None) -> None:
-        self.seen_leases.pop(lease.id, None)
-        usage = self.lease_usage.pop(lease.id, {})
-        # A `ws run` under its own name, so run times and peaks are learned by it.
-        name = lease.name if lease.kind == "run" else f"{lease.kind} {lease.name}"
-        self.store.attempt("lease", lease.id, "ended" if lease.granted_at else "gave up",
-                           ended or time.time(), usage, name=name,
-                           started_at=lease.granted_at or lease.requested_at,
-                           cores=lease.cores, mem_mib=lease.mem_mib, vram_mib=0,
-                           priority=lease.priority, expect_seconds=lease.expect_seconds)
+    def _record_foreground(self, job) -> None:
+        """One attempt row for a `ws run` or pytest run that has ended, under its own name
+        (so run times and peaks are learned by it), with what it used."""
+        usage = self.fg_usage.pop(job.id, {})
+        outcome = {"done": "done", "failed": "failed", "cancelled": "cancelled"}.get(job.status, "ended")
+        self.store.attempt("job", job.id, outcome, job.ended_at or time.time(), usage, name=job.name,
+                           started_at=job.started_at or job.submitted_at, exit_code=job.exit_code,
+                           cores=job.cores, mem_mib=job.mem_mib, vram_mib=0,
+                           priority=job.priority, expect_seconds=job.expect_seconds)
 
     def _learned(self, holders, load):
         """`holders` with expect_seconds set to the learned upper (P80) run time, which the
@@ -508,11 +497,10 @@ class Daemon:
         return out
 
     @staticmethod
-    def box_load(active, leases, cpu_view):
+    def box_load(active, cpu_view):
         """(Cores held by managed work, busy-ness of the rest): what a sample records, and
         their sum is the load run times are learned against."""
-        assigned = {c for h in list(active) + [l for l in leases if l.status == "granted"]
-                    for c in (h.cpus or ())}
+        assigned = {c for h in active for c in (h.cpus or ())}
         cores = cpu_view.cores if cpu_view else []
         unmanaged = sum(b for core, b in zip(cores, cpu_view.busy if cpu_view else [])
                         if not set(core) & assigned)
@@ -523,9 +511,8 @@ class Daemon:
         if now - self.sample_at < SAMPLE_SECONDS:
             return
         self.sample_at = now
-        held = [l for l in view.leases if l.status == "granted"]
-        holders = list(view.active) + held
-        cores_held, unmanaged = self.box_load(view.active, view.leases, view.cpu)
+        holders = list(view.active)
+        cores_held, unmanaged = self.box_load(view.active, view.cpu)
         self.store.sample(
             now, cores_held=cores_held,
             unmanaged_busy=round(unmanaged, 2),
@@ -535,8 +522,11 @@ class Daemon:
             mem_pressure=view.mem.pressure_some if view.mem else None,
             mem_pressure_full=view.mem.pressure_full if view.mem else None,
             vram_used_mib=view.vram_used_mib, gpu_busy_pct=busy, pair=view.pair, model=view.loaded,
-            running=len(view.active), queued=len(view.queued), leases_held=len(held),
-            leases_waiting=len(view.leases) - len(held), waiting_on=json.dumps(why) if why else None)
+            running=sum(1 for h in holders if not h.in_terminal),
+            queued=sum(1 for h in view.queued if not h.in_terminal),
+            leases_held=sum(1 for h in holders if h.in_terminal),
+            leases_waiting=sum(1 for h in view.queued if h.in_terminal),
+            waiting_on=json.dumps(why) if why else None)
         self.store.prune_samples(now - SAMPLE_KEEP_DAYS * 86400)
 
     def publish_page(self) -> None:
@@ -575,7 +565,7 @@ class Daemon:
             self.wake.clear()
 
     def listen_for_wakes(self) -> None:
-        """A lease request pokes the wake socket, so it is granted without waiting a tick."""
+        """A new job pokes the wake socket, so it is started without waiting a tick."""
         path = self.cfg.wake_path
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
