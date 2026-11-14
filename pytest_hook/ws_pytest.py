@@ -1,15 +1,15 @@
 """pytest plugin: a pytest run waits for its cores from the workstation manager.
 
 Loaded in every venv through PYTEST_PLUGINS=ws_pytest with this directory on
-PYTHONPATH (set in ~/.bashrc; see the README). Before collection, the run asks the
-broker for a lease, waits until it is granted, and pins itself (and its xdist
-workers) to those cores; the lease ends with the run.
+PYTHONPATH (set in ~/.bashrc; see the README). Before collection, the run queues a
+job of kind pytest, waits until it is granted, and pins itself (and its xdist
+workers) to those cores; the job ends with the run, with pytest's exit status.
 
 It asks for 1 core and 2 GB unless told otherwise: `-n N` (xdist) asks for N cores,
 `-n auto` for the broker's pytest_auto_cores and then runs that many workers;
 WS_PYTEST_CORES and WS_PYTEST_MEM (e.g. 8G) override. WS_PYTEST=0 or
-`-p no:ws_pytest` skips it. Runs inside a job or lease, xdist workers,
---collect-only and --help take no lease. Any failure here prints one line and the
+`-p no:ws_pytest` skips it. Runs inside a job, xdist workers, --collect-only and
+--help queue nothing. Any failure here prints one line and the
 run goes ahead unpinned.
 """
 
@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 _REPO = Path(os.path.realpath(__file__)).parent.parent
-_state = {"lease": None, "cfg": None}
+_state = {"job": None, "cfg": None, "exit": None}
 
 
 def _package():
@@ -39,7 +39,7 @@ def _package():
 def _skip(config) -> bool:
     if os.environ.get("WS_PYTEST", "1") == "0" or os.environ.get("PYTEST_XDIST_WORKER"):
         return True
-    if os.environ.get("WS_JOB_ID") or os.environ.get("WS_LEASE"):
+    if os.environ.get("WS_JOB_ID"):
         return True
     opt = config.option
     return bool(getattr(opt, "collectonly", False) or getattr(opt, "help", False)
@@ -48,10 +48,10 @@ def _skip(config) -> bool:
 
 
 def _acquire(config, cores=None) -> None:
-    if _state["lease"] is not None or _state["cfg"] is not None or _skip(config):
+    if _state["job"] is not None or _state["cfg"] is not None or _skip(config):
         return
     _package()
-    from workstation_manager import config as wsconfig, lease as wslease
+    from workstation_manager import config as wsconfig, foreground
     from workstation_manager.cli import parse_size
     cfg = wsconfig.load()
     _state["cfg"] = cfg
@@ -65,15 +65,16 @@ def _acquire(config, cores=None) -> None:
         elif isinstance(n, int) and n > 0:
             cores = n
         else:
-            cores = cfg.lease_cores
+            cores = cfg.pytest_cores
     mem = parse_size(os.environ["WS_PYTEST_MEM"]) if os.environ.get("WS_PYTEST_MEM") \
-        else cfg.lease_mem_mib
+        else cfg.pytest_mem_mib
     name = "pytest " + os.path.basename(os.getcwd())
-    got = wslease.acquire(cfg, "pytest", name, cores, mem, wait_limit=cfg.lease_wait_seconds)
+    got = foreground.acquire(cfg, "pytest", name, cores, mem, wait_limit=cfg.pytest_wait_seconds,
+                             argv=sys.argv[1:])
     if got is None:
         return
-    wslease.enter(got)
-    _state["lease"] = got
+    foreground.enter(got)
+    _state["job"] = got
     if auto:
         config.option.numprocesses = got.cores
 
@@ -83,8 +84,8 @@ def _guarded(config, cores=None) -> None:
         _acquire(config, cores)
     except KeyboardInterrupt:
         raise
-    except Exception as exc:  # never fail a test run over its lease
-        print(f"ws: no core lease ({type(exc).__name__}: {exc}); running unpinned",
+    except Exception as exc:  # never fail a test run over the queue
+        print(f"ws: not queued ({type(exc).__name__}: {exc}); running unpinned",
               file=sys.stderr)
 
 
@@ -95,18 +96,22 @@ def pytest_cmdline_main(config):
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_xdist_auto_num_workers(config):
-    """xdist asks how many workers `-n auto` means: as many as the lease's cores."""
+    """xdist asks how many workers `-n auto` means: as many as the job's cores."""
     _guarded(config)
-    lease = _state["lease"]
-    return lease.cores if lease is not None else None
+    job = _state["job"]
+    return job.cores if job is not None else None
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _state["exit"] = int(exitstatus)
 
 
 def pytest_unconfigure(config):
-    lease, cfg = _state["lease"], _state["cfg"]
-    _state["lease"] = None
-    if lease is not None:
+    job, cfg = _state["job"], _state["cfg"]
+    _state["job"] = None
+    if job is not None:
         try:
-            from workstation_manager import lease as wslease
-            wslease.release(cfg, lease)
+            from workstation_manager import foreground
+            foreground.release(cfg, job, _state["exit"])
         except Exception:
             pass  # the broker ends it once this process is gone

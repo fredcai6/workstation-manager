@@ -2,7 +2,7 @@
 
 README.md describes the broker and the job contract. The scheduling rules live in
 `workstation_manager/scheduler.py`; change them there and in `tests/test_scheduler.py`
-(card rules) or `tests/test_host.py` (cores, memory, leases).
+(card rules) or `tests/test_host.py` (cores, memory, `ws run` and pytest).
 
 In a worktree, run the tests with `python3 -m pytest -p no:ws_pytest -q tests`: the
 pytest hook loads `workstation_manager` from the main checkout, so otherwise the

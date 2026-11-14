@@ -30,8 +30,8 @@ class TestLive(unittest.TestCase):
         self.conf = d / "config.toml"
         self.conf.write_text(f'state_dir = "{d / "state"}"\npage_dirs = []\nmem_margin_mib = 1024\n')
         self.env = dict(os.environ, WORKSTATION_MANAGER_CONFIG=str(self.conf), WS_EXPECT="1m")
-        # The pytest lease this suite runs under sets the thread counts for its own core.
-        for k in ("WS_JOB_ID", "WS_LEASE", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+        # The pytest job this suite runs under sets the thread counts for its own core.
+        for k in ("WS_JOB_ID", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                   "MKL_NUM_THREADS"):
             self.env.pop(k, None)
         self.cfg = config.load(self.conf)
@@ -58,7 +58,7 @@ class TestLive(unittest.TestCase):
         self.ticker.join()
         for p in self.patches:
             p.stop()
-        for j in self.d.store.jobs():
+        for j in self.d.store.jobs(kinds=("batch",)):
             subprocess.run(["systemctl", "--user", "stop", j.unit], capture_output=True)
         self.tmp.cleanup()
 
@@ -95,20 +95,19 @@ class TestLive(unittest.TestCase):
         events = [e["what"] for e in self.d.store.events(0)]
         self.assertTrue(any("memory limit" in e for e in events), events)
 
-    def test_pytest_run_waits_for_and_holds_a_lease(self):
+    def test_pytest_run_waits_for_its_cores_and_records_its_exit(self):
         t = Path(self.tmp.name) / "test_probe.py"
         t.write_text("import os\n"
                      "def test_pinned():\n"
-                     "    assert os.environ.get('WS_LEASE')\n"
+                     "    assert os.environ.get('WS_JOB_ID')\n"
                      "    assert len(os.sched_getaffinity(0)) == 2, os.sched_getaffinity(0)\n")
         env = dict(self.env, PYTHONPATH=str(REPO / "pytest_hook"), PYTEST_PLUGINS="ws_pytest")
         r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(t)],
                            env=env, capture_output=True, text=True, cwd=self.tmp.name, timeout=60)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        leases = self.d.store.leases(("done",))
-        self.assertEqual(len(leases), 1)
-        self.assertEqual(leases[0].kind, "pytest")
-        self.assertIsNotNone(leases[0].granted_at)
+        runs = self.d.store.jobs(kinds=("pytest",))
+        self.assertEqual([(j.status, j.exit_code) for j in runs], [("done", 0)])
+        self.assertIsNotNone(runs[0].started_at)
 
     @unittest.skipUnless(shutil.which("docker") and subprocess.run(
         ["docker", "image", "inspect", "alpine:latest"], capture_output=True).returncode == 0,
@@ -126,15 +125,17 @@ class TestLive(unittest.TestCase):
         events = [e["what"] for e in self.d.store.events(0)]
         self.assertTrue(any("memory limit" in e for e in events), events)
 
-    def test_ws_run_holds_a_lease_and_caps_memory(self):
+    def test_ws_run_holds_its_cores_caps_memory_and_records_its_exit(self):
         r = self.ws("run", "--cores", "1", "--mem", "200M", "--", sys.executable, "-c",
-                    "import os; print(len(os.sched_getaffinity(0)), os.environ['WS_LEASE'])", timeout=60)
+                    "import os; print(len(os.sched_getaffinity(0)), os.environ['WS_JOB_ID'])", timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.split()[0], "2")
         r = self.ws("run", "--mem", "200M", "--", sys.executable, "-c",
                     "x = bytearray(600 * 1024 * 1024); x[::4096] = b'1' * len(x[::4096])", timeout=60)
         self.assertEqual(r.returncode, 137, r.stderr)
         self.assertIn("raise --mem", r.stderr)
+        runs = self.d.store.jobs(kinds=("run",))
+        self.assertEqual([(j.status, j.exit_code) for j in runs], [("done", 0), ("failed", 137)])
 
 
 if __name__ == "__main__":
