@@ -1,4 +1,20 @@
-"""Broker state in one SQLite file. The CLI writes requests; the daemon acts on them."""
+"""Broker state in one SQLite file. The CLI writes requests; the daemon acts on them.
+
+Every piece of work is a job, whatever runs it: `ws submit` (kind batch), `ws run`
+(kind run) and pytest (kind pytest) share one table, one id sequence, one set of
+states (queued, running, stopping, done, failed, cancelled; `ended` for foreground
+work whose process went away without saying how it ended) and one history.
+
+Rationale: the scheduler already treats them as one queue with one set of room
+checks; the one real difference is who owns the process. The broker starts a batch
+job as a systemd unit, so it can stop, requeue and retry it; a `ws run` or pytest
+run is its caller's own process, which the broker only grants cores and watches.
+`Job.in_terminal` carries that difference, nothing else does.
+Rejected: separate jobs and leases tables. Their ids overlapped (#768 beside
+`ws run #1326`), foreground results were never recorded, and lease rows were
+deleted after a day, so run times of `ws run` were learned from one day's runs.
+See: #24.
+"""
 
 from __future__ import annotations
 
@@ -38,35 +54,20 @@ CREATE TABLE IF NOT EXISTS jobs (
     legacy INTEGER NOT NULL DEFAULT 0,
     priority INTEGER NOT NULL DEFAULT 0,
     expect_seconds INTEGER,
-    backfill INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS leases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind TEXT NOT NULL,
-    name TEXT NOT NULL,
-    owner TEXT,
-    pid INTEGER NOT NULL,
+    backfill INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'batch',
+    pid INTEGER,
     pid_start INTEGER,
-    cores INTEGER NOT NULL,
-    mem_mib INTEGER NOT NULL,
-    cwd TEXT,
-    unit TEXT,
-    status TEXT NOT NULL,
-    requested_at REAL NOT NULL,
-    granted_at REAL,
-    ended_at REAL,
-    cpus TEXT,
-    priority INTEGER NOT NULL DEFAULT 0,
-    expect_seconds INTEGER
+    scope TEXT
 );
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (
     at REAL NOT NULL, job_id INTEGER, what TEXT NOT NULL
 );
--- One row per run of a job (each attempt) or lease: what it declared and what it used.
+-- One row per run of a job (each attempt): what it declared and what it used.
 CREATE TABLE IF NOT EXISTS attempts (
-    kind TEXT NOT NULL,             -- job | lease
-    ref INTEGER NOT NULL,           -- job id or lease id
+    kind TEXT NOT NULL,             -- job (see below)
+    ref INTEGER NOT NULL,           -- the job id
     name TEXT,
     started_at REAL, ended_at REAL NOT NULL,
     outcome TEXT NOT NULL,          -- done | failed | retry | requeued | interrupted | cancelled | ended
@@ -77,25 +78,31 @@ CREATE TABLE IF NOT EXISTS attempts (
     container_peak_mib INTEGER,
     expect_seconds INTEGER
 );
+-- kind is 'job' (ref is a jobs id); 'lease' rows are foreground runs recorded before
+-- they were jobs, whose lease row is gone.
 CREATE INDEX IF NOT EXISTS attempts_ref ON attempts (kind, ref);
--- The whole box once a minute, and what holds up each waiting job and lease.
+-- The whole box once a minute, and what holds up each waiting job.
 CREATE TABLE IF NOT EXISTS samples (
     at REAL NOT NULL,
     cores_held INTEGER, unmanaged_busy REAL,
     mem_available_mib INTEGER, mem_declared_mib INTEGER, mem_unrealized_mib INTEGER,
     vram_used_mib INTEGER, gpu_busy_pct INTEGER, pair TEXT, model TEXT,
-    running INTEGER, queued INTEGER, leases_held INTEGER, leases_waiting INTEGER,
-    waiting_on TEXT                 -- JSON: "job:N" / "lease:N" -> reason
+    running INTEGER, queued INTEGER,           -- batch jobs
+    leases_held INTEGER, leases_waiting INTEGER,  -- `ws run` and pytest, running and waiting
+    waiting_on TEXT                 -- JSON: "job:N" -> reason (before the merge also "lease:N")
 );
 """
 
 ACTIVE = ("running", "stopping")
+ENDED = ("done", "failed", "cancelled", "ended")
+KINDS = ("batch", "run", "pytest")
 # Columns added after the first schema, with their definitions, for older databases.
 JOB_COLUMNS = {"cores": "INTEGER NOT NULL DEFAULT 1", "mem_mib": "INTEGER NOT NULL DEFAULT 0",
                "cpus": "TEXT", "legacy": "INTEGER NOT NULL DEFAULT 0",
                "priority": "INTEGER NOT NULL DEFAULT 0", "expect_seconds": "INTEGER",
-               "backfill": "INTEGER NOT NULL DEFAULT 0"}
-LEASE_COLUMNS = {"priority": "INTEGER NOT NULL DEFAULT 0", "expect_seconds": "INTEGER"}
+               "backfill": "INTEGER NOT NULL DEFAULT 0",
+               "kind": "TEXT NOT NULL DEFAULT 'batch'", "pid": "INTEGER", "pid_start": "INTEGER",
+               "scope": "TEXT"}
 ATTEMPT_COLUMNS = {"expect_seconds": "INTEGER"}
 
 
@@ -133,6 +140,12 @@ class Job:
     priority: int = 0
     expect_seconds: Optional[int] = None  # how long it should run (an estimate; never enforced)
     backfill: bool = False          # started ahead of the first in line, on its estimate
+    kind: str = "batch"             # batch (`ws submit`) | run (`ws run`) | pytest
+    # Foreground work (run, pytest): the caller's process, and the scope `ws run` puts
+    # its command in.
+    pid: Optional[int] = None
+    pid_start: Optional[int] = None
+    scope: Optional[str] = None
 
     @property
     def key(self) -> str:
@@ -143,48 +156,29 @@ class Job:
         return self.submitted_at
 
     @property
-    def unit(self) -> str:
-        return f"{'gpu' if self.legacy else 'ws'}-job-{self.id}"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
-
-
-@dataclasses.dataclass
-class Lease:
-    id: int
-    kind: str                       # pytest | run
-    name: str
-    owner: Optional[str]
-    pid: int
-    pid_start: Optional[int]
-    cores: int
-    mem_mib: int
-    cwd: Optional[str]
-    unit: Optional[str]             # the scope `ws run` puts its command in
-    status: str                     # waiting | granted | done
-    requested_at: float
-    granted_at: Optional[float]
-    ended_at: Optional[float]
-    cpus: Optional[List[int]]
-    priority: int = 0
-    expect_seconds: Optional[int] = None
-
-    vram_mib = 0                    # leases hold no VRAM
-    legacy = False
-
-    @property
-    def key(self) -> str:
-        return f"lease:{self.id}"
-
-    @property
-    def queued_at(self) -> float:
-        return self.requested_at
+    def in_terminal(self) -> bool:
+        """Its caller's own process runs it (`ws run`, pytest): the broker grants it cores
+        and watches it, but cannot stop, requeue or retry it."""
+        return self.kind != "batch"
 
     @property
     def fast(self) -> bool:
         """pytest: short, a caller blocked on it. It skips the queue; `ws run` waits in it."""
         return self.kind == "pytest"
+
+    @property
+    def unit(self) -> Optional[str]:
+        if self.in_terminal:
+            return self.scope
+        return f"{'gpu' if self.legacy else 'ws'}-job-{self.id}"
+
+    @property
+    def tag(self) -> str:
+        """How it runs, for the status page: "" for batch."""
+        return {"run": "ws run", "pytest": "pytest"}.get(self.kind, "")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
 
 
 def describe(cores: int, mem_mib: int, vram_mib: int, legacy: bool = False) -> str:
@@ -210,11 +204,47 @@ class Store:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
                 if col == "legacy":  # every job so far was submitted under the old names
                     self.db.execute("UPDATE jobs SET legacy=1")
-        for table, cols in (("leases", LEASE_COLUMNS), ("attempts", ATTEMPT_COLUMNS)):
-            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
-            for col, ddl in cols.items():
-                if col not in have:
-                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(attempts)")}
+        for col, ddl in ATTEMPT_COLUMNS.items():
+            if col not in have:
+                self.db.execute(f"ALTER TABLE attempts ADD COLUMN {col} {ddl}")
+        self._absorb_leases()
+
+    def _absorb_leases(self) -> None:
+        """Move the rows of a pre-merge `leases` table into jobs, numbered after the
+        last job (job ids stay, since running units and logs are named by them), and
+        point their attempts at the new ids. The old table is kept as leases_premerge.
+        A process still running the old code recreates an empty `leases` table when it
+        opens the store; rows that reach it are absorbed too, and it is dropped."""
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='leases'").fetchone():
+            return
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(leases)")}
+        get = lambda r, c, d=None: r[c] if c in cols else d
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.db.execute("SELECT * FROM leases ORDER BY id").fetchall()
+            for r in rows:
+                status = {"waiting": "queued", "granted": "running"}.get(r["status"])
+                if status is None:  # done: how it ended was never recorded
+                    status = "ended" if r["granted_at"] else "cancelled"
+                cur = self.db.execute(
+                    "INSERT INTO jobs (name, owner, vram_mib, argv, cwd, retries, grace_seconds, status,"
+                    " submitted_at, started_at, ended_at, cores, mem_mib, cpus, priority, expect_seconds,"
+                    " kind, pid, pid_start, scope) VALUES (?,?,0,'[]',?,0,0,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (r["name"], r["owner"], r["cwd"] or "", status, r["requested_at"], r["granted_at"],
+                     r["ended_at"], r["cores"], r["mem_mib"], r["cpus"], get(r, "priority", 0),
+                     get(r, "expect_seconds"), r["kind"], r["pid"], r["pid_start"], r["unit"]))
+                self.db.execute("UPDATE attempts SET kind='job', ref=? WHERE kind='lease' AND ref=?",
+                                (cur.lastrowid, r["id"]))
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                               " AND name='leases_premerge'").fetchone():
+                self.db.execute("DROP TABLE leases")
+            else:
+                self.db.execute("ALTER TABLE leases RENAME TO leases_premerge")
+            self.db.execute("COMMIT")
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
 
     # -- jobs -------------------------------------------------------------
     def submit(self, name, owner, vram_mib, argv, cwd, retries, grace_seconds,
@@ -241,20 +271,27 @@ class Store:
         row = self.db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return self._job(row) if row else None
 
-    def jobs(self, statuses=None) -> List[Job]:
-        if statuses:
-            q = "SELECT * FROM jobs WHERE status IN (%s) ORDER BY priority DESC, submitted_at, id" % (
-                ",".join("?" * len(statuses)))
-            rows = self.db.execute(q, tuple(statuses)).fetchall()
-        else:
-            rows = self.db.execute("SELECT * FROM jobs ORDER BY priority DESC, submitted_at, id").fetchall()
+    def jobs(self, statuses=None, kinds=None) -> List[Job]:
+        where, args = [], []
+        for col, vals in (("status", statuses), ("kind", kinds)):
+            if vals:
+                where.append(f"{col} IN ({','.join('?' * len(vals))})")
+                args += list(vals)
+        q = "SELECT * FROM jobs" + (" WHERE " + " AND ".join(where) if where else "") \
+            + " ORDER BY priority DESC, submitted_at, id"
+        return [self._job(r) for r in self.db.execute(q, args).fetchall()]
+
+    def recent(self, limit=10, kinds=("batch", "run")) -> List[Job]:
+        rows = self.db.execute(
+            "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled','ended') AND kind IN (%s)"
+            " ORDER BY ended_at DESC LIMIT ?" % ",".join("?" * len(kinds)), (*kinds, limit)).fetchall()
         return [self._job(r) for r in rows]
 
-    def recent(self, limit=10) -> List[Job]:
-        rows = self.db.execute(
-            "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled')"
-            " ORDER BY ended_at DESC LIMIT ?", (limit,)).fetchall()
-        return [self._job(r) for r in rows]
+    def tally(self, kind: str, since: float) -> Dict[str, int]:
+        """How the work of `kind` that ended since `since` ended: status -> count."""
+        return {r[0]: r[1] for r in self.db.execute(
+            "SELECT status, COUNT(*) FROM jobs WHERE kind=? AND ended_at>=? GROUP BY status",
+            (kind, since)).fetchall()}
 
     def update(self, job_id: int, **fields) -> None:
         if "cpus" in fields and fields["cpus"] is not None:
@@ -270,41 +307,42 @@ class Store:
                 fields[k] = v
         self.update(job_id, **fields)
 
-    # -- leases: foreground work (pytest, `ws run`) holding cores while it runs --
-    def request_lease(self, kind, name, owner, pid, pid_start, cores, mem_mib, cwd,
-                      unit=None, now=None, priority=0, expect_seconds=None) -> int:
+    # -- foreground work: `ws run` and pytest, run by their caller's own process --
+    def request(self, kind, name, owner, pid, pid_start, cores, mem_mib, cwd, scope=None,
+                argv=(), now=None, priority=0, expect_seconds=None) -> int:
+        """Queue foreground work; its caller waits for `grant` and runs it itself."""
         cur = self.db.execute(
-            "INSERT INTO leases (kind, name, owner, pid, pid_start, cores, mem_mib, cwd, unit,"
-            " status, requested_at, priority, expect_seconds) VALUES (?,?,?,?,?,?,?,?,?, 'waiting', ?,?,?)",
-            (kind, name, owner, pid, pid_start, cores, mem_mib, cwd, unit,
-             time.time() if now is None else now, priority, expect_seconds))
+            "INSERT INTO jobs (name, owner, vram_mib, argv, cwd, retries, grace_seconds, status,"
+            " submitted_at, cores, mem_mib, priority, expect_seconds, kind, pid, pid_start, scope)"
+            " VALUES (?,?,0,?,?,0,0,'queued',?,?,?,?,?,?,?,?,?)",
+            (name, owner, json.dumps(list(argv)), cwd, time.time() if now is None else now,
+             cores, mem_mib, priority, expect_seconds, kind, pid, pid_start, scope))
         return cur.lastrowid
 
-    def lease(self, lease_id: int) -> Optional[Lease]:
-        row = self.db.execute("SELECT * FROM leases WHERE id=?", (lease_id,)).fetchone()
-        return self._lease(row) if row else None
+    def grant(self, job_id: int, cpus, now=None) -> None:
+        self.db.execute("UPDATE jobs SET status='running', started_at=?, cpus=? WHERE id=?"
+                        " AND status='queued' AND kind!='batch'",
+                        (time.time() if now is None else now, json.dumps(list(cpus)), job_id))
 
-    def leases(self, statuses=("waiting", "granted")) -> List[Lease]:
-        q = "SELECT * FROM leases WHERE status IN (%s) ORDER BY requested_at, id" % (
-            ",".join("?" * len(statuses)))
-        return [self._lease(r) for r in self.db.execute(q, tuple(statuses)).fetchall()]
+    def finish(self, job_id: int, exit_code: Optional[int], now=None) -> None:
+        """Foreground work ends: done or failed by its exit code; `ended` when its
+        process went away without one; cancelled if it was never granted (its caller
+        stopped waiting, or ran without the queue)."""
+        now = time.time() if now is None else now
+        self.db.execute(
+            "UPDATE jobs SET ended_at=?, exit_code=?, status=CASE"
+            " WHEN status='queued' THEN 'cancelled' WHEN ? IS NULL THEN 'ended'"
+            " WHEN ?=0 THEN 'done' ELSE 'failed' END"
+            " WHERE id=? AND status IN ('queued','running') AND kind!='batch'",
+            (now, exit_code, exit_code, exit_code, job_id))
 
-    def _lease(self, row) -> Lease:
-        d = dict(row)
-        d["cpus"] = json.loads(d["cpus"]) if d.get("cpus") else None
-        return Lease(**d)
-
-    def grant_lease(self, lease_id: int, cpus, now=None) -> None:
-        self.db.execute("UPDATE leases SET status='granted', granted_at=?, cpus=? WHERE id=?"
-                        " AND status='waiting'",
-                        (time.time() if now is None else now, json.dumps(list(cpus)), lease_id))
-
-    def end_lease(self, lease_id: int, now=None) -> None:
-        self.db.execute("UPDATE leases SET status='done', ended_at=? WHERE id=? AND status!='done'",
-                        (time.time() if now is None else now, lease_id))
-
-    def prune_leases(self, before: float) -> None:
-        self.db.execute("DELETE FROM leases WHERE status='done' AND ended_at<?", (before,))
+    def unrecorded(self, since: float) -> List[Job]:
+        """Foreground work that ended since `since` and has no attempt row yet."""
+        rows = self.db.execute(
+            "SELECT * FROM jobs j WHERE kind!='batch' AND status IN ('done','failed','cancelled','ended')"
+            " AND ended_at>=? AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.kind='job' AND a.ref=j.id)"
+            " ORDER BY id", (since,)).fetchall()
+        return [self._job(r) for r in rows]
 
     # -- key/value and history ---------------------------------------------
     def get_kv(self, key: str, default=None):

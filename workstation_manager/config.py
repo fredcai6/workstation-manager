@@ -102,8 +102,8 @@ class Config:
     # pytest runs may use these too: they are rare and short (1.7% of the time, ~2.5 min,
     # 1 core over 3 days to 2026-11-12), so briefly sharing a core with the desktop is cheap.
     reserve_cores: int = 1
-    # Physical cores batch never takes, kept for pytest alone. None: it shares `reserve_cores`.
-    lease_reserve_cores: int = 0
+    # Physical cores the queue never takes, kept for pytest alone. 0: pytest shares `reserve_cores`.
+    pytest_reserve_cores: int = 0
     # Cores only small work may take: at most that many cores, planned (learned P80) to end
     # within small_job_seconds. It fills them first, so short runs move along behind long ones.
     small_lane_cores: int = 2
@@ -112,11 +112,11 @@ class Config:
     mem_margin_mib: int = 8192
     # What a pytest run asks for unless it says otherwise (WS_PYTEST_CORES /
     # WS_PYTEST_MEM, or -n N with xdist); -n auto asks for pytest_auto_cores.
-    lease_cores: int = 1
-    lease_mem_mib: int = 2048
+    pytest_cores: int = 1
+    pytest_mem_mib: int = 2048
     pytest_auto_cores: int = 4
     # A pytest run that has waited this long runs anyway, unpinned, and says so.
-    lease_wait_seconds: float = 900.0
+    pytest_wait_seconds: float = 900.0
 
     @property
     def db_path(self) -> Path:

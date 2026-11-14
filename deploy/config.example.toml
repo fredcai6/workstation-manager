@@ -28,17 +28,17 @@
 # Physical cores never handed to managed work (desktop, agents, the pair, the broker),
 # and cores batch never takes, kept for pytest runs and `ws run`.
 # reserve_cores = 2
-# lease_reserve_cores = 2
+# pytest_reserve_cores = 2
 
 # Memory kept free on top of every declared footprint (MemAvailable headroom).
 # mem_margin_mib = 8192
 
 # What a pytest run asks for unless it says otherwise; -n auto asks for pytest_auto_cores.
-# lease_cores = 1
-# lease_mem_mib = 2048
+# pytest_cores = 1
+# pytest_mem_mib = 2048
 # pytest_auto_cores = 4
 # A pytest run that has waited this long runs anyway, unpinned.
-# lease_wait_seconds = 900
+# pytest_wait_seconds = 900
 
 # Single model: the env file above and the pair's measured VRAM.
 # pair_vram_mib = 30000
