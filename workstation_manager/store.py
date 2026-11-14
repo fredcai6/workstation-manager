@@ -13,7 +13,7 @@ run is its caller's own process, which the broker only grants cores and watches.
 Rejected: separate jobs and leases tables. Their ids overlapped (#768 beside
 `ws run #1326`), foreground results were never recorded, and lease rows were
 deleted after a day, so run times of `ws run` were learned from one day's runs.
-See: workstation-manager PR "One job table".
+See: #24.
 """
 
 from __future__ import annotations
