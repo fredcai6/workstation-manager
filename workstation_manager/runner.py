@@ -60,6 +60,9 @@ def start(cfg: Config, job: Job) -> None:
           if os.environ.get("WORKSTATION_MANAGER_CONFIG") else []),
         *(["-p", f"MemoryMax={job.mem_mib}M", "-p", "MemorySwapMax=0"]
           if job.mem_mib else []),
+        # The cgroup holds the job to its cores, so nothing in it can widen its affinity
+        # (once cpuset is delegated to the user manager; until then the wrapper's pinning).
+        *(["-p", f"AllowedCPUs={cpu.format_cpulist(job.cpus)}"] if job.cpus else []),
         sys.executable, str(REPO / "ws"), "_wrap", str(job.id),
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)

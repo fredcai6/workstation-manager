@@ -238,6 +238,16 @@ def user_manager_cgroup() -> Optional[Path]:
     return None
 
 
+def cpuset_enforced() -> bool:
+    """Whether the user manager may hand out cpusets, so AllowedCPUs= holds a unit to its
+    cores. Without it the property is accepted and ignored, and pinning is affinity only."""
+    cg = user_manager_cgroup()
+    try:
+        return cg is not None and "cpuset" in (cg / "cgroup.controllers").read_text().split()
+    except OSError:
+        return False
+
+
 def memory_pressure(cgroup: Optional[Path] = None) -> Tuple[Optional[float], Optional[float]]:
     """(some, full) avg10 memory pressure in %: the share of the last 10 s that some (or
     all) of the cgroup's work stalled waiting for memory. The whole box without a cgroup."""

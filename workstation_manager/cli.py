@@ -26,7 +26,7 @@ import subprocess
 import sys
 from typing import Optional
 
-from . import board, config
+from . import board, config, cpu
 from .collector import collect
 from .renderer import render_json, render_text
 from .store import Store
@@ -239,7 +239,9 @@ def cmd_run(args, cfg) -> int:
     if got is not None:
         leases.enter(got)
         cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}",
-               "-p", f"MemoryMax={args.mem}M", "-p", "MemorySwapMax=0", "--", *argv]
+               "-p", f"MemoryMax={args.mem}M", "-p", "MemorySwapMax=0",
+               *(["-p", f"AllowedCPUs={cpu.format_cpulist(got.cpus)}"] if got.cpus else []),
+               "--", *argv]
     try:
         # Ctrl-C reaches the command through the terminal; a TERM or HUP sent to us is passed on.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
