@@ -575,3 +575,25 @@ class TestMemoryPressure(unittest.TestCase):
                 "full avg10=4.25 avg60=1.00 avg300=0.50 total=2\n")
             self.assertEqual(cpu.memory_pressure(Path(d)), (12.5, 4.25))
             self.assertEqual(cpu.memory_pressure(Path(d) / "missing"), (None, None))
+
+
+class TestEnforcedPinning(unittest.TestCase):
+    def test_job_unit_is_held_to_its_cores(self):
+        from unittest.mock import patch
+        from workstation_manager import runner
+        from workstation_manager.config import Config
+        j = dataclasses.replace(cjob(5, cores=2, cpus=[0, 6, 12, 18], status="running"), cwd="/tmp")
+        with patch.object(runner.subprocess, "run") as run_:
+            runner.start(Config(), j)
+        argv = run_.call_args_list[-1].args[0]
+        self.assertIn("AllowedCPUs=0,6,12,18", argv)
+        self.assertIn(f"MemoryMax={j.mem_mib}M", argv)
+
+    def test_cpuset_enforced_reads_the_user_managers_controllers(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "cgroup.controllers").write_text("cpu memory pids\n")
+            with patch.object(cpu, "user_manager_cgroup", return_value=Path(d)):
+                self.assertFalse(cpu.cpuset_enforced())
+                (Path(d) / "cgroup.controllers").write_text("cpuset cpu io memory pids\n")
+                self.assertTrue(cpu.cpuset_enforced())
