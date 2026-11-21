@@ -131,8 +131,11 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
 
 - **Physical cores, alternating CCDs.** A holder gets whole cores, least busy first,
   in the order 0, 6, 1, 7, ... (each with its sibling, 12, 18, 13, 19, ...).
-  Pinning is CPU affinity only: nothing stops unmanaged processes from running on a
-  held core.
+  Each job's unit and each `ws run` scope also carries `AllowedCPUs=` its cores, so
+  nothing inside it can widen its affinity. That takes the cpuset controller, delegated
+  to the user manager (Setup); without it the broker logs a warning at start and
+  pinning is affinity alone. Either way, nothing stops unmanaged processes from
+  running on a held core.
 - **Room.** The queue (jobs and `ws run`) never takes the last `reserve_cores` (1):
   it is left for the desktop, agents, the interactive pair and the broker. pytest runs
   share it: they are rare and short, so a few minutes of two things on one core costs
@@ -264,6 +267,9 @@ cp deploy/config.example.toml ~/.config/workstation-manager/config.toml   # then
 ln -s "$PWD/deploy/workstation-manager.service" ~/.config/systemd/user/
 systemctl --user enable --now workstation-manager
 loginctl enable-linger "$USER"     # so the broker and jobs run without a login
+# so AllowedCPUs= holds each job to its cores (takes effect at the next boot):
+sudo mkdir -p /etc/systemd/system/user@.service.d
+printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate-cpuset.conf
 # every pytest run takes a lease (in ~/.bashrc, after the interactive guard):
 export PYTHONPATH="$HOME/projects/workstation-manager/pytest_hook${PYTHONPATH:+:$PYTHONPATH}"
 export PYTEST_PLUGINS=ws_pytest

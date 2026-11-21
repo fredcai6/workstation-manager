@@ -556,6 +556,9 @@ class Daemon:
         for svc in self.cfg.services.values():
             proxy.serve(self.gate, self.cfg.listen, svc.port, svc.backend)
         self.listen_for_wakes()
+        if not cpu.cpuset_enforced():
+            log.warning("cpuset is not delegated to the user manager: jobs are pinned by affinity "
+                        "only, and AllowedCPUs= is ignored (README, Setup)")
         # One reading of the cores before the first decision, so a restart on a busy
         # machine does not see idle cores.
         self.meter.sample()
