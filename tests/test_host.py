@@ -27,13 +27,15 @@ def lease(id, cores=1, mem=2 * GB, status="waiting", cpus=None):
 
 
 def hview(queued=(), active=(), leases=(), busy=None, avail=50 * GB, unrealized=0,
-          pair="up", used=None, reserve=2, lease_reserve=0, lane=0, small_s=0.0, **kw):
+          pair="up", used=None, reserve=2, lease_reserve=0, lane=0, small_s=0.0,
+          pressure=(None, None), hold=0.0, stop=0.0, **kw):
     if used is None:
         used = (12000 if pair == "up" else 0) + sum(j.vram_mib for j in active)
     return View(now=10_000.0, queued=list(queued), active=list(active), pair=pair,
                 last_interactive_at=10_000.0, vram_total_mib=TOTAL, vram_used_mib=used,
                 cpu=CpuView(CORES, busy or [0.0] * 12, reserve, lease_reserve, lane, small_s),
-                mem=MemView(60 * GB, avail, 8 * GB, unrealized), leases=list(leases), **kw)
+                mem=MemView(60 * GB, avail, 8 * GB, unrealized, *pressure, hold, stop),
+                leases=list(leases), **kw)
 
 
 def run(v):
@@ -520,3 +522,56 @@ class TestPriorityAcrossResources(unittest.TestCase):
         busy = dataclasses.replace(busy, cpus=[c for core in CORES[4:8] for c in core])
         acts = self.go([self.hot(cores=4)], [busy, over], lease_reserve=2)
         self.assertEqual(acts, [("stop_job", 5, "requeue")])
+
+
+class TestMemoryPressure(unittest.TestCase):
+    def started(self, acts):
+        return [a[1] for a in acts if a[0] in ("start_job", "grant_lease")]
+
+    def stopped(self, acts):
+        return [a[1] for a in acts if a[0] == "stop_job"]
+
+    def test_nothing_queued_starts_under_pressure(self):
+        why = {}
+        v = hview(queued=[cjob(1)], pressure=(15.0, 2.0), hold=10.0, stop=20.0)
+        self.assertEqual(decide(v, MARGIN, 12500, 30, False, why), [])
+        self.assertIn("memory pressure", why["job:1"])
+        v = hview(queued=[cjob(1)], pressure=(5.0, 1.0), hold=10.0, stop=20.0)
+        self.assertEqual(self.started(run(v)), [1])
+
+    def test_pytest_is_not_held_by_pressure(self):
+        fast = lease(7)                  # a pytest lease: the fast lane
+        v = hview(leases=[fast], pressure=(40.0, 5.0), hold=10.0, stop=20.0)
+        self.assertEqual(self.started(run(v)), [7])
+
+    def test_at_the_stop_one_job_is_requeued_lowest_priority_then_newest(self):
+        old = dataclasses.replace(cjob(1, status="running", cpus=[0, 12]), started_at=100.0)
+        new = dataclasses.replace(cjob(2, status="running", cpus=[6, 18]), started_at=200.0)
+        vip = dataclasses.replace(cjob(3, status="running", cpus=[1, 13]), started_at=300.0, priority=5)
+        v = hview(active=[old, new, vip], pressure=(60.0, 25.0), hold=10.0, stop=20.0)
+        acts = run(v)
+        self.assertEqual(self.stopped(acts), [2])
+        self.assertEqual([a for a in acts if a[0] == "stop_job"][0][2], "requeue")
+
+    def test_one_at_a_time(self):
+        going = cjob(1, status="stopping", cpus=[0, 12])
+        other = dataclasses.replace(cjob(2, status="running", cpus=[6, 18]), started_at=200.0)
+        v = hview(active=[going, other], pressure=(60.0, 25.0), hold=10.0, stop=20.0)
+        self.assertEqual(self.stopped(run(v)), [])
+
+    def test_little_memory_left_requeues_without_pressure(self):
+        j = dataclasses.replace(cjob(1, status="running", cpus=[0, 12]), started_at=100.0)
+        self.assertEqual(self.stopped(run(hview(active=[j], avail=3 * GB))), [1])    # margin 8 GB
+        self.assertEqual(self.stopped(run(hview(active=[j], avail=5 * GB))), [])
+
+    def test_off_when_unset(self):
+        j = dataclasses.replace(cjob(1, status="running", cpus=[0, 12]), started_at=100.0)
+        self.assertEqual(self.stopped(run(hview(active=[j], pressure=(90.0, 90.0)))), [])
+
+    def test_reading_pressure(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "memory.pressure").write_text(
+                "some avg10=12.50 avg60=3.00 avg300=1.00 total=5\n"
+                "full avg10=4.25 avg60=1.00 avg300=0.50 total=2\n")
+            self.assertEqual(cpu.memory_pressure(Path(d)), (12.5, 4.25))
+            self.assertEqual(cpu.memory_pressure(Path(d) / "missing"), (None, None))

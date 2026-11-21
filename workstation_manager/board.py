@@ -116,7 +116,7 @@ def host_summary(s: Dict[str, Any]) -> Dict[str, Any]:
     busy = cpu.get("busy") or []
     granted = [l for l in s.get("leases", ()) if l["status"] == "granted"]
     charged = b.get("mem_charged") or {}
-    # Counted as the scheduler counts it: the learned peak where there is one.
+    # Counted as the scheduler counts it: its name's largest peak, padded, where known.
     declared = sum(charged.get(f"job:{j['id']}", j.get("mem_mib") or 0) for j in s["running"]) \
         + sum(charged.get(f"lease:{l['id']}", l["mem_mib"]) for l in granted)
     room = None
