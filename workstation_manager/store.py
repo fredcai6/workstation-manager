@@ -97,6 +97,7 @@ JOB_COLUMNS = {"cores": "INTEGER NOT NULL DEFAULT 1", "mem_mib": "INTEGER NOT NU
                "backfill": "INTEGER NOT NULL DEFAULT 0"}
 LEASE_COLUMNS = {"priority": "INTEGER NOT NULL DEFAULT 0", "expect_seconds": "INTEGER"}
 ATTEMPT_COLUMNS = {"expect_seconds": "INTEGER"}
+SAMPLE_COLUMNS = {"mem_pressure": "REAL"}       # memory pressure "some", avg10 %
 
 
 @dataclasses.dataclass
@@ -210,7 +211,8 @@ class Store:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
                 if col == "legacy":  # every job so far was submitted under the old names
                     self.db.execute("UPDATE jobs SET legacy=1")
-        for table, cols in (("leases", LEASE_COLUMNS), ("attempts", ATTEMPT_COLUMNS)):
+        for table, cols in (("leases", LEASE_COLUMNS), ("attempts", ATTEMPT_COLUMNS),
+                            ("samples", SAMPLE_COLUMNS)):
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for col, ddl in cols.items():
                 if col not in have:

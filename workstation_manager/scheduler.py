@@ -54,6 +54,10 @@ Rules, in order:
    planned to end within `small_seconds`). Small work fills them first, then the rest;
    other work never takes them. Small work that fits in the lane may start ahead of a
    bigger first in line, since it takes nothing that one could use.
+14. Memory pressure: nothing queued starts while memory pressure ("some", the share
+   of the last 10 s that work stalled on memory) is at `hold_pct` or more. At `stop_pct`
+   ("full"), or with MemAvailable under half the margin, one running job is requeued,
+   lowest priority then newest, one at a time, ahead of systemd-oomd (which SIGKILLs).
 """
 
 from __future__ import annotations
@@ -89,6 +93,10 @@ class MemView:
     available_mib: int
     margin_mib: int
     unrealized_mib: int = 0         # declared by running holders, not yet in use (shown, not counted)
+    pressure_some: Optional[float] = None   # % of the last 10 s some work stalled on memory
+    pressure_full: Optional[float] = None   # ... all of it
+    hold_pct: float = 0.0           # nothing queued starts at this "some" (0: off)
+    stop_pct: float = 0.0           # one running job is requeued at this "full" (0: off)
 
 
 @dataclasses.dataclass
@@ -200,6 +208,9 @@ class Host:
                 return f"cores: needs {h.cores}, {max(0, room)} free{extra}"
         if self.mem and h.mem_mib > self.mem_room:
             return f"memory: needs {_gb(h.mem_mib)}, {_gb(max(0, self.mem_room))} free"
+        if self.mem and not fast and self.mem.hold_pct \
+                and (self.mem.pressure_some or 0) >= self.mem.hold_pct:
+            return f"memory pressure: work stalled on memory {self.mem.pressure_some:.0f}% of the last 10 s"
         return None
 
     def leaves_room_for(self, h, head, ended_mem_mib: int = 0) -> bool:
@@ -276,6 +287,9 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
         if v.pair in ("up", "starting"):
             actions.append(("stop_pair",))
         return actions
+
+    # Memory running out: requeue one job before the kernel or systemd-oomd kills something.
+    actions += _pressure_stop(v)
 
     if v.vram_total_mib is None or v.vram_used_mib is None:
         why.update({h.key: "the card is unreadable; nothing starts" for h in queue})
@@ -412,7 +426,36 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
             why[f"job:{first.id}"] += f"; the pair is held for {hold_minutes - idle_min:.0f} more min"
     elif v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
         actions.append(("start_pair", want))
-    return actions
+    stopped: set = set()
+    out = []
+    for a in actions:                   # one stop per job, the first reason given
+        if a[0] == "stop_job":
+            if a[1] in stopped:
+                continue
+            stopped.add(a[1])
+        out.append(a)
+    return out
+
+
+def _pressure_stop(v: View) -> List[Action]:
+    """At the stop pressure, or with MemAvailable under half the margin, requeue one
+    running job: lowest priority, then newest (it has the least work to lose). One at a
+    time: none while a job is still stopping, since its memory is not free yet."""
+    m = v.mem
+    if not m:
+        return []
+    full = m.pressure_full or 0
+    low = m.available_mib < m.margin_mib / 2
+    if not ((m.stop_pct and full >= m.stop_pct) or low):
+        return []
+    if any(j.status == "stopping" for j in v.active):
+        return []
+    running = [j for j in v.active if j.status == "running" and j.mem_mib]
+    if not running:
+        return []
+    j = min(running, key=lambda j: (j.priority, -(j.started_at or 0)))
+    note = f"memory pressure {full:.0f}%" if not low else f"{_gb(m.available_mib)} memory left"
+    return [("stop_job", j.id, "requeue", f"requeue: {note}; it resumes when there is room")]
 
 
 def _ended_mem(v: View, start: Optional[float]) -> int:

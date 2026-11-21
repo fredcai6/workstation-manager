@@ -227,6 +227,31 @@ def own_cgroup() -> Optional[Path]:
     return None
 
 
+def user_manager_cgroup() -> Optional[Path]:
+    """The user manager's cgroup (user@UID.service), which holds jobs, leases, agents
+    and the desktop session, and is the one systemd-oomd watches."""
+    cg = own_cgroup()
+    while cg is not None and cg != cg.parent:
+        if cg.name.startswith("user@") and cg.name.endswith(".service"):
+            return cg
+        cg = cg.parent
+    return None
+
+
+def memory_pressure(cgroup: Optional[Path] = None) -> Tuple[Optional[float], Optional[float]]:
+    """(some, full) avg10 memory pressure in %: the share of the last 10 s that some (or
+    all) of the cgroup's work stalled waiting for memory. The whole box without a cgroup."""
+    path = cgroup / "memory.pressure" if cgroup else Path("/proc/pressure/memory")
+    out = {}
+    try:
+        for line in path.read_text().splitlines():
+            kind, *kv = line.split()
+            out[kind] = float(dict(x.split("=") for x in kv)["avg10"])
+    except (OSError, ValueError, KeyError):
+        pass
+    return out.get("some"), out.get("full")
+
+
 def cgroup_usage(cgroup: Optional[Path]) -> Tuple[Optional[float], Optional[int]]:
     """(CPU seconds used, peak memory MiB) of a cgroup so far; None where unreadable."""
     cpu_s = peak = None

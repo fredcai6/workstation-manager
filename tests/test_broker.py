@@ -474,21 +474,28 @@ class TestLeaseRecord(Tmp):
 
 
 class TestMemoryCharge(unittest.TestCase):
-    def test_charge_is_the_learned_peak_at_most_the_declaration(self):
+    def test_charge_is_the_largest_peak_of_its_name_padded(self):
         from workstation_manager import estimates as E
-        runs = [E.MemRun(f"fit-{i}", "/w", 16384, 6000 + 300 * (i % 4)) for i in range(20)]
+        runs = [E.MemRun("fit-a", "/w", 28672, p) for p in (16000, 17000, 17500, 9000)]
         m = E.fit_memory(runs)
-        c = E.memory_charge(m, "fit-99", "/w", 16384)
-        self.assertGreater(c, 6600)                   # above all but the top few peaks
-        self.assertLess(c, 16384)                     # well under the declaration
-        new = E.memory_charge(m, "other", "/elsewhere", 16384)
-        self.assertGreater(new, c)                    # nothing known: charged nearer its declaration
-        self.assertLessEqual(new, 16384)
-        self.assertIsNone(E.memory_charge(E.fit_memory(runs[:3]), "fit-1", "/w", 16384))
+        self.assertEqual(E.memory_charge(m, "fit-a", "/w", 28672), round(17500 * 1.1))
+        # A run that peaked low (resumed near the end) does not pull it down.
+        self.assertEqual(E.memory_charge(E.fit_memory(runs + [E.MemRun("fit-a", "/w", 28672, 500)]),
+                                         "fit-a", "/w", 28672), round(17500 * 1.1))
+        self.assertEqual(E.memory_charge(m, "fit-a", "/w", 16384), 16384)    # never above its declaration
 
-    def test_killed_at_the_declaration_counts_as_at_least_that(self):
+    def test_new_name_goes_by_its_stem_then_its_declaration(self):
         from workstation_manager import estimates as E
-        runs = [E.MemRun(f"big-{i}", "/w", 4096, 4096 if i % 2 else 5000) for i in range(10)]
+        runs = [E.MemRun(f"fit-L-{y}", "/w", 28672, 17000) for y in (2021, 2022, 2023)]
+        m = E.fit_memory(runs)
+        self.assertEqual(E.memory_charge(m, "fit-L-2025", "/w", 28672), round(17000 * 1.2))
+        self.assertIsNone(E.memory_charge(m, "other", "/w", 28672))           # counted as declared
+        two = E.fit_memory(runs[:2])
+        self.assertIsNone(E.memory_charge(two, "fit-L-2021", "/w", 28672))    # 1 run: not yet
+
+    def test_killed_at_the_declaration_is_charged_it(self):
+        from workstation_manager import estimates as E
+        runs = [E.MemRun("big-x", "/w", 4096, 4096 if i % 2 else 5000) for i in range(4)]
         self.assertEqual(E.memory_charge(E.fit_memory(runs), "big-x", "/w", 4096), 4096)
 
 

@@ -32,6 +32,10 @@
 
 # Memory kept free on top of every declared footprint (MemAvailable headroom).
 # mem_margin_mib = 8192
+# Memory pressure (% of the last 10 s stalled on memory): nothing starts at the hold;
+# at the stop, one running job is requeued (systemd-oomd SIGKILLs at 50%).
+# mem_pressure_hold_pct = 10.0
+# mem_pressure_stop_pct = 20.0
 
 # What a pytest run asks for unless it says otherwise; -n auto asks for pytest_auto_cores.
 # lease_cores = 1

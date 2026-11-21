@@ -79,7 +79,9 @@ class Daemon:
         self.model: Optional[estimates.Model] = None
         self.model_at = 0.0
         self.learned: dict = {}         # key -> (typical, plan) seconds, this tick
-        self.mem_model: Optional[estimates.Model] = None
+        self.mem_model: Optional[estimates.MemModel] = None
+        # Memory pressure is read where systemd-oomd reads it (the whole box outside a user manager).
+        self.pressure_cgroup = cpu.user_manager_cgroup()
         self.mem_used: dict = {}        # key -> MiB a running holder uses now
         self.charged: dict = {}         # key -> MiB the scheduler counts for it, this tick
         self.seen_leases: dict = {}     # id -> granted lease, to record it once it ends
@@ -221,7 +223,9 @@ class Daemon:
         return (scheduler.CpuView([c.cpus for c in self.cores], list(busy), self.cfg.reserve_cores,
                                    self.cfg.lease_reserve_cores,
                                    self.cfg.small_lane_cores, self.cfg.small_job_seconds),
-                scheduler.MemView(total, available, self.cfg.mem_margin_mib, unrealized))
+                scheduler.MemView(total, available, self.cfg.mem_margin_mib, unrealized,
+                                  *cpu.memory_pressure(self.pressure_cgroup),
+                                  self.cfg.mem_pressure_hold_pct, self.cfg.mem_pressure_stop_pct))
 
     def observe_pair(self) -> None:
         if self.pair_action and self.pair_action.is_alive():
@@ -373,7 +377,7 @@ class Daemon:
                 job = self.store.get(act[1])
                 self.store.update(job.id, status="stopping", stop_request=act[2])
                 runner.stop(job)
-                self.store.event(job.id, f"stopping ({act[2]})")
+                self.store.event(job.id, f"stopping ({act[3] if len(act) > 3 else act[2]})")
             elif kind == "stop_pair":
                 self.stop_pair()
             elif kind == "start_pair":
@@ -491,7 +495,7 @@ class Daemon:
             if got:
                 self.learned[h.key] = (round(got[0]), round(got[1]))
                 h = dataclasses.replace(h, expect_seconds=max(1, round(got[1])))
-            # Memory: the learned P95 peak, or what it already uses if that is more.
+            # Memory: its name's largest peak, padded, or what it already uses if that is more.
             charge = None if getattr(h, "fast", False) else estimates.memory_charge(
                 self.mem_model, h.name, estimates.where_of(getattr(h, "argv", None) or [], h.cwd or ""),
                 h.mem_mib)
@@ -528,6 +532,7 @@ class Daemon:
             mem_available_mib=view.mem.available_mib if view.mem else None,
             mem_declared_mib=sum(h.mem_mib for h in holders),
             mem_unrealized_mib=view.mem.unrealized_mib if view.mem else None,
+            mem_pressure=view.mem.pressure_some if view.mem else None,
             vram_used_mib=view.vram_used_mib, gpu_busy_pct=busy, pair=view.pair, model=view.loaded,
             running=len(view.active), queued=len(view.queued), leases_held=len(held),
             leases_waiting=len(view.leases) - len(held), waiting_on=json.dumps(why) if why else None)

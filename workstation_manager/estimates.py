@@ -143,15 +143,26 @@ def _mean(m: Model, name: str, where: str, base: float) -> Tuple[float, int]:
     return mean, known
 
 
-# -- memory: what a run peaks at, given what it declared ----------------------------
+# -- memory: what a run peaks at ---------------------------------------------------
 #
-# Same model on log(peak / declared), without load (memory does not depend on it). The
-# scheduler charges a run its P95 peak, not its declaration: declarations are padded
-# (the median run peaks at half), and each run is still killed at its declaration, so
-# the charge never goes above it. A run with no runs of its name or stem behind it gets
-# a wider P95, so new work is charged near what it declared.
+# The scheduler charges a run the largest peak its name has reached, plus PEAK_PAD,
+# once the name has PEAK_RUNS runs behind it; a newer name, its stem's largest peak
+# ("cfb-fit-L-2025" by "cfb-fit-L") plus STEM_PAD; otherwise its declaration. Never
+# more than the declaration, where it is still killed. Declarations are padded (the
+# median run peaks at half), so a steady heavy job is charged far below what it asks.
+#
+# Rationale: with n runs, the next one passes their largest peak about one time in
+# n + 1, and runs that peaked low (resumed near the end, a smoke test) cannot pull the
+# charge down. Rejected: a P95 from a fitted spread. One spread for all names (until
+# 11-21) charged every heavy, steady job its full declaration; a spread per name was
+# tight on a short record and undercounted when early runs had peaked low; trusting
+# a name's one or two runs undercounted worse. Out-of-time backtest 11-21, runs
+# declaring 16 GB or more: peaks within the charge 93.9% -> 99.5%, GB above it 52 -> 12,
+# charged 96.3% -> 94.5% of declared; cfb-entry-fit-L-2023 28 GB -> 19 GB.
 
-Z95 = 1.6449
+PEAK_RUNS = 3           # runs of a name (or stem) before its largest peak is trusted
+PEAK_PAD = 0.10         # over the largest peak of its name
+STEM_PAD = 0.20         # over the largest peak of its stem, for a name not yet known
 
 
 @dataclasses.dataclass
@@ -162,32 +173,44 @@ class MemRun:
     peak: float                 # MiB
 
 
-def fit_memory(runs: Iterable[MemRun]) -> Optional[Model]:
-    runs = [r for r in runs if r.declared > 0 and r.peak > 0]
-    if len(runs) < MIN_RUNS:
-        return None
-    # A peak at or past the declaration was cut off there (killed): it says "at least".
-    return _fit([math.log(min(r.peak, r.declared) / r.declared) for r in runs], [r.declared for r in runs],
-                [None] * len(runs), [{"where": r.where, "stem": stem(r.name), "name": r.name} for r in runs])
+@dataclasses.dataclass
+class MemModel:
+    peaks: Dict[str, Dict[str, Tuple[float, int]]]     # level -> key -> (largest peak MiB, runs)
 
 
-def memory_charge(m: Optional[Model], name: str, where: str, declared: Optional[int]) -> Optional[int]:
-    """MiB the scheduler counts for a run: its learned P95 peak, at most its declaration."""
+def fit_memory(runs: Iterable[MemRun]) -> Optional[MemModel]:
+    peaks: Dict[str, Dict[str, Tuple[float, int]]] = {"name": {}, "stem": {}}
+    for r in runs:
+        if r.declared <= 0 or r.peak <= 0:
+            continue
+        for level, key in (("name", r.name), ("stem", stem(r.name))):
+            top, n = peaks[level].get(key, (0.0, 0))
+            peaks[level][key] = (max(top, r.peak), n + 1)
+    return MemModel(peaks) if peaks["name"] else None
+
+
+def memory_charge(m: Optional[MemModel], name: str, where: str, declared: Optional[int]) -> Optional[int]:
+    """MiB the scheduler counts for a run: the largest peak its name (else its stem) has
+    reached, padded, at most its declaration. None with too few runs to go on: it is
+    counted at its declaration."""
     if not m or not declared:
         return None
-    mean, known = _mean(m, name, where, declared)
-    spread = m.sigma * math.sqrt(1 + 1 / (known + 1))
-    return int(min(declared, math.ceil(math.exp(mean + Z95 * spread))))
+    for level, key, pad in (("name", name, PEAK_PAD), ("stem", stem(name), STEM_PAD)):
+        top, n = m.peaks[level].get(key, (0.0, 0))
+        if n >= PEAK_RUNS:
+            return int(min(declared, math.ceil(top * (1 + pad))))
+    return None
 
 
 def memory_runs_from(db) -> List[MemRun]:
-    """Peaks of finished attempts. Cancelled and requeued attempts stopped part way, so
-    their peaks may be short of a full run's; they are left out."""
+    """Peaks of attempts that ran to the end. Cancelled, requeued and failed attempts may
+    have stopped part way, short of a full run's peak, so they are left out: the charge
+    is centred on the usual peak, and runs that died early would pull it down."""
     rows = db.execute(
         "SELECT a.name, a.mem_mib, a.peak_mib, j.argv, j.cwd, l.cwd FROM attempts a"
         " LEFT JOIN jobs j ON a.kind='job' AND j.id=a.ref"
         " LEFT JOIN leases l ON a.kind='lease' AND l.id=a.ref"
-        " WHERE a.peak_mib > 0 AND a.mem_mib > 0 AND a.outcome IN ('done','failed','retry','ended')"
+        " WHERE a.peak_mib > 0 AND a.mem_mib > 0 AND a.outcome IN ('done','ended')"
         " AND a.ended_at - a.started_at > 60").fetchall()
     return [MemRun(name, where_of(json.loads(argv) if argv else [], jcwd or lcwd or ""), mem, peak)
             for name, mem, peak, argv, jcwd, lcwd in rows]

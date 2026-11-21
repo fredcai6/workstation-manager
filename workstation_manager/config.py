@@ -110,6 +110,13 @@ class Config:
     small_job_seconds: float = 1800.0
     # Memory kept free on top of every declared footprint (MemAvailable headroom).
     mem_margin_mib: int = 8192
+    # Memory pressure: the share of the last 10 s that work stalled waiting for memory
+    # (PSI), on the user manager's cgroup, which systemd-oomd watches and SIGKILLs in at
+    # 50% for 20 s. Nothing queued starts while "some" is at or above the hold; at the
+    # stop ("full"), or with MemAvailable under half the margin, one running job is
+    # requeued, lowest priority and newest first, so oomd need not act. 0 turns either off.
+    mem_pressure_hold_pct: float = 10.0
+    mem_pressure_stop_pct: float = 20.0
     # What a pytest run asks for unless it says otherwise (WS_PYTEST_CORES /
     # WS_PYTEST_MEM, or -n N with xdist); -n auto asks for pytest_auto_cores.
     lease_cores: int = 1

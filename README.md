@@ -120,8 +120,8 @@ directory in `page_dirs`.
   such as `used 1.6 of 2 cores, peak 10.2 of 16.0 GB over 2.0h`. Use it to size
   `--mem` and `--cores`.
 - `samples`: the whole box once a minute (cores held, unmanaged load, memory
-  available, declared and declared-but-unused, VRAM, the pair, queue length) and what
-  held up each waiting job and lease. Kept 180 days.
+  available, declared and declared-but-unused, memory pressure, VRAM, the pair, queue
+  length) and what held up each waiting job and lease. Kept 180 days.
 
 A unit that ends within 30 s of starting with no exit record (its directory was
 removed, say) counts as a failed attempt, not an interruption, so it is retried
@@ -150,11 +150,21 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   (MemTotal less `mem_margin_mib`, 8 GB) and what is measured: MemAvailable less the
   margin. Memory running holders declared but have not used yet is not held back again:
   each is capped at its declaration, and most peak near half of it. Each holder is
-  counted at its learned peak, not its declaration: the same model as run times, on
-  peak / declared, with the P95 (wider where few runs of its name or stem are known),
-  never more than the declaration and never less than what a running one uses now.
-  On the 11-12 record 97% of later runs peaked within it, and it counted 91% of what was
-  declared; that falls as names recur. The kill limit stays at the declaration.
+  counted at the largest peak its name has reached, plus 10%, once the name has 3 runs
+  behind it; a new name at its stem's largest peak plus 20% (`cfb-fit-L-2025` by
+  `cfb-fit-L`); otherwise at its declaration. Never more than the declaration, and
+  never less than what a running one uses now. Out of time on the 11-21 record, runs
+  declaring 16 GB or more peaked within it 99.5% of the time, and steady heavy work is
+  counted far below what it asks (`cfb-entry-fit-L-2023`: 28 GB declared, 19 GB counted).
+  The kill limit stays at the declaration.
+- **Memory pressure.** The broker reads memory pressure (the share of the last 10 s
+  that work stalled waiting for memory) on the user manager's cgroup, the one
+  systemd-oomd watches. Nothing queued starts while it is 10% or more
+  (`mem_pressure_hold_pct`). At 20% of full stalls (`mem_pressure_stop_pct`), or with
+  MemAvailable under half the margin, one running job is requeued, lowest priority and
+  then newest, one at a time, with its usual grace. That is well ahead of systemd-oomd,
+  which SIGKILLs whatever in the user manager reclaims most (a job, an agent, the
+  desktop) at 50% for 20 s. pytest runs are not held by it.
 - **Order.** One queue holds jobs and `ws run` commands: highest `--priority` first
   (default 0; `ws priority ID N` changes a job's), then first come first served.
   pytest runs are the fast lane: they go first, first come first served, even during
