@@ -97,7 +97,8 @@ JOB_COLUMNS = {"cores": "INTEGER NOT NULL DEFAULT 1", "mem_mib": "INTEGER NOT NU
                "backfill": "INTEGER NOT NULL DEFAULT 0"}
 LEASE_COLUMNS = {"priority": "INTEGER NOT NULL DEFAULT 0", "expect_seconds": "INTEGER"}
 ATTEMPT_COLUMNS = {"expect_seconds": "INTEGER"}
-SAMPLE_COLUMNS = {"mem_pressure": "REAL"}       # memory pressure "some", avg10 %
+SAMPLE_COLUMNS = {"mem_pressure": "REAL",       # memory pressure "some", avg10 % (the hold signal)
+                  "mem_pressure_full": "REAL"}  # ... "full", avg10 % (the requeue signal)
 
 
 @dataclasses.dataclass

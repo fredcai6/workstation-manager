@@ -168,6 +168,8 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   then newest, one at a time, with its usual grace. That is well ahead of systemd-oomd,
   which SIGKILLs whatever in the user manager reclaims most (a job, an agent, the
   desktop) at 50% for 20 s. pytest runs are not held by it.
+  Each minute's sample records both `some` (`samples.mem_pressure`) and `full`
+  (`samples.mem_pressure_full`).
 - **Order.** One queue holds jobs and `ws run` commands: highest `--priority` first
   (default 0; `ws priority ID N` changes a job's), then first come first served.
   pytest runs are the fast lane: they go first, first come first served, even during
