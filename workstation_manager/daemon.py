@@ -459,7 +459,7 @@ class Daemon:
                                      "reserved": self.cfg.reserved(now),
                                      "waiting_on": why,
                                      "estimates": {k: list(v) for k, v in self.learned.items()},
-                                     "model": self.model.summary() if self.model else None,
+                                     "estimates_summary": self.model.summary() if self.model else None,
                                      "mem_charged": dict(self.charged),
                                      "projection": {k: list(v) for k, v in
                                                     scheduler.project(view, self.cfg.margin_mib).items()},
@@ -533,6 +533,7 @@ class Daemon:
             mem_declared_mib=sum(h.mem_mib for h in holders),
             mem_unrealized_mib=view.mem.unrealized_mib if view.mem else None,
             mem_pressure=view.mem.pressure_some if view.mem else None,
+            mem_pressure_full=view.mem.pressure_full if view.mem else None,
             vram_used_mib=view.vram_used_mib, gpu_busy_pct=busy, pair=view.pair, model=view.loaded,
             running=len(view.active), queued=len(view.queued), leases_held=len(held),
             leases_waiting=len(view.leases) - len(held), waiting_on=json.dumps(why) if why else None)

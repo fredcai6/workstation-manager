@@ -353,6 +353,40 @@ class TestObservePair(Tmp):
         self.assertTrue(d.gate.ok[self.cfg.asr_backend])
 
 
+class TestTickPublishesModelAndSamples(Tmp):
+    def tick(self):
+        d = daemon.Daemon(self.cfg, store=self.store)
+        d.sample_at = 0
+        with mock.patch("workstation_manager.interactive.state", return_value="up"), \
+                mock.patch("workstation_manager.interactive.loaded_model", return_value="dory-4b"), \
+                mock.patch.object(daemon, "read_card", return_value=("card", 32624, 12000, 0)), \
+                mock.patch.object(daemon.cpu, "memory_pressure", return_value=(3.5, 1.25)):
+            d.tick()
+        return self.store.get_kv("daemon")
+
+    def test_model_key_is_the_llm_and_estimates_summary_is_separate(self):
+        b = self.tick()
+        self.assertEqual(b["model"], "dory-4b")
+        self.assertIn("estimates_summary", b)
+
+    def test_sample_records_some_and_full_pressure(self):
+        self.tick()
+        row = self.store.db.execute("SELECT mem_pressure, mem_pressure_full FROM samples").fetchone()
+        self.assertEqual((row[0], row[1]), (3.5, 1.25))
+
+    def test_old_samples_table_gains_the_full_column(self):
+        import sqlite3
+        path = self.dir / "old.db"
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE samples (at REAL NOT NULL, mem_pressure REAL)")
+        db.execute("INSERT INTO samples VALUES (1.0, 2.0)")
+        db.commit()
+        db.close()
+        st = Store(path)
+        row = st.db.execute("SELECT mem_pressure, mem_pressure_full FROM samples").fetchone()
+        self.assertEqual((row[0], row[1]), (2.0, None))
+
+
 if __name__ == "__main__":
     unittest.main()
 
