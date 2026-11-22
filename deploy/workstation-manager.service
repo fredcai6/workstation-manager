@@ -7,6 +7,10 @@ ExecStart=%h/.local/bin/ws daemon
 Restart=always
 # The bridge addresses it listens on appear when Docker starts; retry until they do.
 RestartSec=5
+# Last to go when memory runs out: below the user-unit default (200) and queue jobs (800)
+# for the kernel, and avoided by systemd-oomd. See: deploy/README-oom.md
+OOMScoreAdjust=100
+ManagedOOMPreference=avoid
 
 [Install]
 WantedBy=default.target

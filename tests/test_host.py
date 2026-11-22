@@ -588,6 +588,7 @@ class TestEnforcedPinning(unittest.TestCase):
         argv = run_.call_args_list[-1].args[0]
         self.assertIn("AllowedCPUs=0,6,12,18", argv)
         self.assertIn(f"MemoryMax={j.mem_mib}M", argv)
+        self.assertIn("OOMScoreAdjust=800", argv)      # killed before the desktop
 
     def test_cpuset_enforced_reads_the_user_managers_controllers(self):
         from unittest.mock import patch
