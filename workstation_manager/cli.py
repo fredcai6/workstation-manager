@@ -245,7 +245,7 @@ def cmd_run(args, cfg) -> int:
     try:
         # Ctrl-C reaches the command through the terminal; a TERM or HUP sent to us is passed on.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
-        proc = subprocess.Popen(cmd)
+        proc = subprocess.Popen(cmd, preexec_fn=_prefer_oom_kill if got is not None else None)
         for sig in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, lambda s, f: proc.send_signal(s))
         code = proc.wait()
@@ -255,6 +255,13 @@ def cmd_run(args, cfg) -> int:
         print(f"ws run: the command was killed; if it ran past --mem {args.mem}M, "
               "raise --mem", file=sys.stderr)
     return 128 - code if code < 0 else code
+
+
+def _prefer_oom_kill() -> None:
+    """A `ws run` command is queue work: the kernel kills it before the desktop."""
+    from .runner import JOB_OOM_SCORE_ADJ
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write(str(JOB_OOM_SCORE_ADJ))
 
 
 def cmd_cancel(args, cfg) -> int:

@@ -32,6 +32,10 @@ PCT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
 OOM_RE = re.compile(r"RESOURCE_EXHAUSTED|out of memory|hipErrorOutOfMemory|HIP out of memory", re.I)
 
 
+# Kernel OOM-kill preference for queue work; user units default to 200.
+JOB_OOM_SCORE_ADJ = 800
+
+
 def label(job: Job) -> str:
     return f"{'gpu-manager' if job.legacy else 'workstation-manager'}.job={job.id}"
 
@@ -55,6 +59,9 @@ def start(cfg: Config, job: Job) -> None:
         "-p", f"TimeoutStopSec={job.grace_seconds + 30}",
         # A kill at MemoryMax takes the command, not the unit: the wrapper records it.
         "-p", "OOMPolicy=continue",
+        # When the whole box runs out, the kernel kills a job first: jobs save progress and
+        # resume, the desktop and the broker (100) don't. See: deploy/README-oom.md
+        "-p", f"OOMScoreAdjust={JOB_OOM_SCORE_ADJ}",
         # The wrapper reads the same config (and so the same state) as this broker.
         *([f"--setenv=WORKSTATION_MANAGER_CONFIG={os.environ['WORKSTATION_MANAGER_CONFIG']}"]
           if os.environ.get("WORKSTATION_MANAGER_CONFIG") else []),
