@@ -6,7 +6,7 @@ from pathlib import Path
 
 from workstation_manager import cpu
 from workstation_manager.scheduler import CpuView, MemView, View, decide
-from workstation_manager.store import Lease, Store
+from workstation_manager.store import Job, Store
 
 from tests.test_scheduler import MARGIN, PAIR, TOTAL, job
 
@@ -20,22 +20,23 @@ def cjob(id, cores=1, mem=2 * GB, vram=0, status="queued", cpus=None):
     return dataclasses.replace(job(id, vram, status=status), cores=cores, mem_mib=mem, cpus=cpus)
 
 
-def lease(id, cores=1, mem=2 * GB, status="waiting", cpus=None):
-    return Lease(id=id, kind="pytest", name=f"l{id}", owner=None, pid=1, pid_start=None,
-                 cores=cores, mem_mib=mem, cwd="/", unit=None, status=status,
-                 requested_at=float(id), granted_at=None, ended_at=None, cpus=cpus)
+def ptest(id, cores=1, mem=2 * GB, status="queued", cpus=None):
+    """A pytest run: the fast lane."""
+    return dataclasses.replace(job(id, 0, status=status, submitted=float(id)), kind="pytest", pid=1,
+                               cores=cores, mem_mib=mem, cpus=cpus, retries=0)
 
 
-def hview(queued=(), active=(), leases=(), busy=None, avail=50 * GB, unrealized=0,
-          pair="up", used=None, reserve=2, lease_reserve=0, lane=0, small_s=0.0,
+def hview(queued=(), active=(), fg=(), busy=None, avail=50 * GB, unrealized=0,
+          pair="up", used=None, reserve=2, pytest_reserve=0, lane=0, small_s=0.0,
           pressure=(None, None), hold=0.0, stop=0.0, **kw):
     if used is None:
         used = (12000 if pair == "up" else 0) + sum(j.vram_mib for j in active)
-    return View(now=10_000.0, queued=list(queued), active=list(active), pair=pair,
+    queued = list(queued) + [j for j in fg if j.status == "queued"]
+    active = list(active) + [j for j in fg if j.status != "queued"]
+    return View(now=10_000.0, queued=queued, active=active, pair=pair,
                 last_interactive_at=10_000.0, vram_total_mib=TOTAL, vram_used_mib=used,
-                cpu=CpuView(CORES, busy or [0.0] * 12, reserve, lease_reserve, lane, small_s),
-                mem=MemView(60 * GB, avail, 8 * GB, unrealized, *pressure, hold, stop),
-                leases=list(leases), **kw)
+                cpu=CpuView(CORES, busy or [0.0] * 12, reserve, pytest_reserve, lane, small_s),
+                mem=MemView(60 * GB, avail, 8 * GB, unrealized, *pressure, hold, stop), **kw)
 
 
 def run(v):
@@ -132,11 +133,11 @@ class TestSmallLane(unittest.TestCase):
         held = dataclasses.replace(timed(8, cores=9, mem=43 * GB, expect=3600, status="running",
                                          cpus=[]), started_at=10_000.0)
         big = timed(1, cores=4, mem=9 * GB, expect=7200)
-        quick = dataclasses.replace(rlease(7, mem=GB), expect_seconds=3)
-        acts = run(hview(queued=[big], leases=[quick], active=[held], **self.LANE))
-        self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])
-        slow = dataclasses.replace(rlease(7, mem=GB), expect_seconds=3600)    # not small
-        self.assertEqual(run(hview(queued=[big], leases=[slow], active=[held], **self.LANE)), [])
+        quick = dataclasses.replace(wsrun(7, mem=GB), expect_seconds=3)
+        acts = run(hview(queued=[big], fg=[quick], active=[held], **self.LANE))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 7)])
+        slow = dataclasses.replace(wsrun(7, mem=GB), expect_seconds=3600)    # not small
+        self.assertEqual(run(hview(queued=[big], fg=[slow], active=[held], **self.LANE)), [])
 
     def test_projection_keeps_big_work_off_the_lane(self):
         from workstation_manager.scheduler import project
@@ -171,28 +172,28 @@ class TestCpuJobsAndTheCard(unittest.TestCase):
 
 class TestLeases(unittest.TestCase):
     def test_lease_is_granted_despite_unmanaged_load(self):
-        acts = run(hview(queued=[cjob(1)], leases=[lease(7)], busy=[1.0] * 12))
-        self.assertEqual(acts, [("grant_lease", 7, [0, 12])])
+        acts = run(hview(queued=[cjob(1)], fg=[ptest(7)], busy=[1.0] * 12))
+        self.assertEqual(acts, [("start_job", 7, [0, 12])])
 
 
     def test_lease_goes_ahead_of_queued_batch(self):
-        acts = run(hview(queued=[cjob(1, cores=10)], leases=[lease(7)]))
-        self.assertEqual(acts, [("grant_lease", 7, [0, 12])])
+        acts = run(hview(queued=[cjob(1, cores=10)], fg=[ptest(7)]))
+        self.assertEqual(acts, [("start_job", 7, [0, 12])])
 
-    def test_batch_leaves_the_lease_cores(self):
-        acts = run(hview(queued=[cjob(1, cores=9)], lease_reserve=2))
+    def test_batch_leaves_the_pytest_cores(self):
+        acts = run(hview(queued=[cjob(1, cores=9)], pytest_reserve=2))
         self.assertEqual(acts, [])
-        acts = run(hview(queued=[cjob(1, cores=8)], leases=[lease(7, cores=3)], lease_reserve=2))
-        self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])   # 10 - 3 = 7 left for batch
-        acts = run(hview(queued=[cjob(1, cores=8)], leases=[lease(7, cores=2)], lease_reserve=2))
-        self.assertEqual([a[:2] for a in acts], [("grant_lease", 7), ("start_job", 1)])
+        acts = run(hview(queued=[cjob(1, cores=8)], fg=[ptest(7, cores=3)], pytest_reserve=2))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 7)])   # 10 - 3 = 7 left for batch
+        acts = run(hview(queued=[cjob(1, cores=8)], fg=[ptest(7, cores=2)], pytest_reserve=2))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 7), ("start_job", 1)])
 
     def test_pytest_shares_the_reserve_core(self):
         # 11-12: pytest held cores 1.7% of the time; it shares the desktop's core instead.
         full = cjob(8, cores=11, status="running", cpus=[])
-        acts = run(hview(active=[full], leases=[lease(7)], reserve=1))
-        self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])
-        acts = run(hview(active=[full], leases=[lease(7, cores=2)], reserve=1))
+        acts = run(hview(active=[full], fg=[ptest(7)], reserve=1))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 7)])
+        acts = run(hview(active=[full], fg=[ptest(7, cores=2)], reserve=1))
         self.assertEqual(acts, [])          # one core left: a 2-core run waits
         # The queue still leaves the reserve alone.
         self.assertEqual(run(hview(queued=[cjob(1, cores=12)], reserve=1)), [])
@@ -200,17 +201,17 @@ class TestLeases(unittest.TestCase):
                          [("start_job", 1)])
 
     def test_granted_lease_holds_its_cores(self):
-        acts = run(hview(queued=[cjob(1)], leases=[lease(7, status="granted", cpus=[0, 12])]))
+        acts = run(hview(queued=[cjob(1)], fg=[ptest(7, status="running", cpus=[0, 12])]))
         self.assertEqual(acts, [("start_job", 1, [6, 18])])
 
     def test_leases_are_granted_during_a_take(self):
-        acts = run(hview(leases=[lease(7)], take=True))
-        self.assertIn(("grant_lease", 7, [0, 12]), acts)
+        acts = run(hview(fg=[ptest(7)], take=True))
+        self.assertIn(("start_job", 7, [0, 12]), acts)
         self.assertIn(("stop_pair",), acts)
 
     def test_small_lease_does_not_overtake_a_big_one(self):
         running = cjob(1, cores=10, status="running", cpus=[c for core in CORES[:10] for c in core])
-        acts = run(hview(active=[running], leases=[lease(7, cores=4), lease(8, cores=1)]))
+        acts = run(hview(active=[running], fg=[ptest(7, cores=4), ptest(8, cores=1)]))
         self.assertEqual(acts, [])
 
 
@@ -271,14 +272,99 @@ class TestStore(unittest.TestCase):
             self.assertEqual((new.legacy, new.unit, runner.label(new)),
                              (False, "ws-job-2", "workstation-manager.job=2"))
 
-    def test_lease_round_trip(self):
+    def test_foreground_round_trip(self):
         with tempfile.TemporaryDirectory() as d:
             s = Store(Path(d) / "broker.db")
-            lid = s.request_lease("pytest", "p", None, 123, 456, 2, 2048, "/")
-            s.grant_lease(lid, [0, 12, 6, 18])
-            self.assertEqual(s.lease(lid).cpus, [0, 12, 6, 18])
-            s.end_lease(lid)
-            self.assertEqual(s.leases(), [])
+            bid = s.submit("b", None, 0, ["x"], "/", 2, 60, mem_mib=1024)
+            fid = s.request("pytest", "p", None, 123, 456, 2, 2048, "/", argv=["-q"])
+            self.assertEqual(fid, bid + 1)                  # one id sequence
+            s.grant(fid, [0, 12, 6, 18])
+            j = s.get(fid)
+            self.assertEqual((j.status, j.cpus, j.argv, j.in_terminal, j.fast),
+                             ("running", [0, 12, 6, 18], ["-q"], True, True))
+            s.finish(fid, 1)
+            self.assertEqual((s.get(fid).status, s.get(fid).exit_code), ("failed", 1))
+            s.finish(fid, 0)                                # ends once
+            self.assertEqual(s.get(fid).status, "failed")
+            ok, lost, gave_up = (s.request("run", n, None, 1, None, 1, 1024, "/") for n in "abc")
+            for i in (ok, lost):
+                s.grant(i, [0])
+            s.finish(ok, 0)
+            s.finish(lost, None)
+            s.finish(gave_up, None)
+            self.assertEqual([s.get(i).status for i in (ok, lost, gave_up)], ["done", "ended", "cancelled"])
+            self.assertEqual([j.id for j in s.recent()], [gave_up, lost, ok])   # pytest apart
+            self.assertEqual(s.tally("pytest", 0), {"failed": 1})
+            s.grant(bid, [1])                               # a grant is for foreground work only
+            self.assertEqual(s.get(bid).status, "queued")
+
+    def test_leases_table_is_absorbed(self):
+        """A pre-merge database: leases move into jobs after the last job, with their
+        attempts; the job ids (units and logs are named by them) stay."""
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "broker.db"
+            db = sqlite3.connect(path)
+            db.executescript("""
+                CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, owner TEXT,
+                  vram_mib INTEGER NOT NULL, argv TEXT NOT NULL, cwd TEXT NOT NULL, retries INTEGER NOT NULL,
+                  grace_seconds INTEGER NOT NULL, status TEXT NOT NULL, submitted_at REAL NOT NULL,
+                  started_at REAL, ended_at REAL, failures INTEGER NOT NULL DEFAULT 0,
+                  interruptions INTEGER NOT NULL DEFAULT 0, exit_code INTEGER, stop_request TEXT,
+                  chunk INTEGER, chunks INTEGER, pct REAL, progress_at REAL, note TEXT,
+                  cores INTEGER NOT NULL DEFAULT 1, mem_mib INTEGER NOT NULL DEFAULT 0, cpus TEXT,
+                  legacy INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 0,
+                  expect_seconds INTEGER, backfill INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE leases (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                  name TEXT NOT NULL, owner TEXT, pid INTEGER NOT NULL, pid_start INTEGER,
+                  cores INTEGER NOT NULL, mem_mib INTEGER NOT NULL, cwd TEXT, unit TEXT,
+                  status TEXT NOT NULL, requested_at REAL NOT NULL, granted_at REAL, ended_at REAL,
+                  cpus TEXT, priority INTEGER NOT NULL DEFAULT 0, expect_seconds INTEGER);
+                CREATE TABLE attempts (kind TEXT NOT NULL, ref INTEGER NOT NULL, name TEXT,
+                  started_at REAL, ended_at REAL NOT NULL, outcome TEXT NOT NULL, exit_code INTEGER,
+                  cores INTEGER, mem_mib INTEGER, vram_mib INTEGER, priority INTEGER,
+                  cpu_seconds REAL, peak_mib INTEGER, container_peak_mib INTEGER);
+                INSERT INTO jobs (id, name, vram_mib, argv, cwd, retries, grace_seconds, status, submitted_at)
+                  VALUES (40, 'fit', 0, '["x"]', '/', 2, 60, 'running', 1.0);
+                INSERT INTO leases VALUES (100, 'run', 'gms-C', 't', 555, 9, 1, 4096, '/w', 'ws-run-555',
+                  'granted', 2.0, 3.0, NULL, '[11, 23]', 0, 2400);
+                INSERT INTO leases VALUES (101, 'pytest', 'pytest x', 't', 556, NULL, 1, 2048, '/x', NULL,
+                  'done', 4.0, 5.0, 9.0, '[0, 12]', 0, NULL);
+                INSERT INTO leases VALUES (102, 'run', 'never', 't', 557, NULL, 1, 2048, '/', NULL,
+                  'done', 4.0, NULL, 6.0, NULL, 0, 60);
+                INSERT INTO attempts (kind, ref, name, ended_at, outcome) VALUES ('lease', 101, 'pytest x', 9.0, 'ended');
+                INSERT INTO attempts (kind, ref, name, ended_at, outcome) VALUES ('lease', 7, 'gone', 1.0, 'ended');
+                INSERT INTO attempts (kind, ref, name, ended_at, outcome) VALUES ('job', 40, 'fit', 1.0, 'retry');
+            """)
+            db.commit()
+            db.close()
+            s = Store(path)
+            fit, run_, py, never = (s.get(i) for i in (40, 41, 42, 43))
+            self.assertEqual((fit.kind, fit.status, fit.unit), ("batch", "running", "ws-job-40"))
+            self.assertEqual((run_.kind, run_.status, run_.pid, run_.unit, run_.cpus, run_.expect_seconds,
+                              run_.started_at), ("run", "running", 555, "ws-run-555", [11, 23], 2400, 3.0))
+            self.assertEqual((py.kind, py.status), ("pytest", "ended"))
+            self.assertEqual(never.status, "cancelled")
+            self.assertEqual([(a["kind"], a["ref"]) for a in s.db.execute(
+                "SELECT kind, ref FROM attempts ORDER BY ended_at, name")],
+                [("job", 40), ("lease", 7), ("job", 42)])
+            self.assertEqual(s.submit("next", None, 0, ["x"], "/", 2, 60), 44)
+            Store(path)                                     # a second open changes nothing
+            self.assertEqual(len(s.jobs()), 5)
+            # A `ws run` still on the old code recreates `leases` when it opens the store.
+            s.db.executescript("""
+                CREATE TABLE leases (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                  name TEXT NOT NULL, owner TEXT, pid INTEGER NOT NULL, pid_start INTEGER,
+                  cores INTEGER NOT NULL, mem_mib INTEGER NOT NULL, cwd TEXT, unit TEXT,
+                  status TEXT NOT NULL, requested_at REAL NOT NULL, granted_at REAL, ended_at REAL,
+                  cpus TEXT, priority INTEGER NOT NULL DEFAULT 0, expect_seconds INTEGER);
+                INSERT INTO leases (kind, name, pid, cores, mem_mib, status, requested_at)
+                  VALUES ('run', 'late', 9, 1, 1024, 'waiting', 50.0);
+            """)
+            again = Store(path)
+            self.assertEqual([(j.id, j.name, j.status) for j in again.jobs(kinds=("run",))][-1],
+                             (45, "late", "queued"))
+            self.assertIsNone(again.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='leases'").fetchone())
 
 
 if __name__ == "__main__":
@@ -349,20 +435,20 @@ class TestWhyWaiting(unittest.TestCase):
         self.assertEqual(why["job:2"], "held back for #1 (first in line)")
 
     def test_started_jobs_and_granted_leases_have_no_reason(self):
-        acts, why = self.why(hview(queued=[cjob(1)], leases=[lease(7)]))
+        acts, why = self.why(hview(queued=[cjob(1)], fg=[ptest(7)]))
         self.assertEqual(len(acts), 2)
         self.assertEqual(why, {})
 
     def test_reasons_change_no_decision(self):
-        v = hview(queued=[cjob(1, mem=16 * GB), cjob(2)], leases=[lease(7, mem=30 * GB)], avail=20 * GB)
+        v = hview(queued=[cjob(1, mem=16 * GB), cjob(2)], fg=[ptest(7, mem=30 * GB)], avail=20 * GB)
         self.assertEqual(run(v), self.why(v)[0])
 
 
-def rlease(id, cores=1, mem=2 * GB, priority=0, expect=None, requested=None, status="waiting", cpus=None):
-    """A `ws run` lease: it waits in the queue with jobs."""
-    return dataclasses.replace(lease(id, cores, mem, status, cpus), kind="run", priority=priority,
+def wsrun(id, cores=1, mem=2 * GB, priority=0, expect=None, requested=None, status="queued", cpus=None):
+    """A `ws run`: it waits in the queue with batch jobs."""
+    return dataclasses.replace(ptest(id, cores, mem, status, cpus), kind="run", priority=priority,
                                expect_seconds=expect,
-                               requested_at=float(id) if requested is None else requested)
+                               submitted_at=float(id) if requested is None else requested)
 
 
 def held(id, cores, start=9_000.0, expect=None, backfill=False, mem=2 * GB, vram=0):
@@ -377,27 +463,55 @@ class TestOneQueue(unittest.TestCase):
 
     def test_ws_run_takes_its_place_by_priority(self):
         busy = dataclasses.replace(held(9, 6), priority=5)   # not stopped: order only
-        acts = run(hview(queued=[cjob(1, cores=2)], leases=[rlease(7, cores=2, priority=5)],
-                         active=[busy], lease_reserve=2))
-        self.assertEqual([a[:2] for a in acts], [("grant_lease", 7)])
+        acts = run(hview(queued=[cjob(1, cores=2)], fg=[wsrun(7, cores=2, priority=5)],
+                         active=[busy], pytest_reserve=2))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 7)])
         acts = run(hview(queued=[dataclasses.replace(cjob(1, cores=2), priority=9)],
-                         leases=[rlease(7, cores=2, priority=5)], active=[busy], lease_reserve=2))
+                         fg=[wsrun(7, cores=2, priority=5)], active=[busy], pytest_reserve=2))
         self.assertEqual([a[:2] for a in acts], [("start_job", 1)])
 
     def test_ws_run_is_held_back_for_an_earlier_job(self):
         why = {}
         acts = decide(hview(queued=[cjob(1, cores=8)], active=[held(9, 4)],
-                                                   leases=[rlease(7, cores=2, requested=50_000)],
-                                                   lease_reserve=2), MARGIN, 12500, 30, False, why)
+                                                   fg=[wsrun(7, cores=2, requested=50_000)],
+                                                   pytest_reserve=2), MARGIN, 12500, 30, False, why)
         self.assertEqual(acts, [])
-        self.assertEqual(why["lease:7"], "held back for #1 (first in line)")
+        self.assertEqual(why["job:7"], "held back for #1 (first in line)")
 
     def test_only_pytest_uses_the_kept_cores_and_skips_unmanaged_load(self):
-        acts = run(hview(leases=[rlease(7, cores=9)], lease_reserve=2))
+        acts = run(hview(fg=[wsrun(7, cores=9)], pytest_reserve=2))
         self.assertEqual(acts, [])
-        acts = run(hview(leases=[lease(8, cores=9)], lease_reserve=2))
-        self.assertEqual([a[:2] for a in acts], [("grant_lease", 8)])
-        acts = run(hview(leases=[rlease(7, cores=2)], busy=[1.0] * 12))
+        acts = run(hview(fg=[ptest(8, cores=9)], pytest_reserve=2))
+        self.assertEqual([a[:2] for a in acts], [("start_job", 8)])
+        acts = run(hview(fg=[wsrun(7, cores=2)], busy=[1.0] * 12))
+        self.assertEqual(acts, [])
+
+
+class TestForegroundIsNeverStopped(unittest.TestCase):
+    """A running `ws run` or pytest run holds cores and memory like batch work, but its
+    caller's process runs it: the broker cannot stop or requeue it."""
+
+    def fg_on(self, id, cores, kind="run", **kw):
+        j = held(id, cores, **kw)
+        return dataclasses.replace(j, kind=kind, pid=1, retries=0)
+
+    def test_a_take_stops_batch_only(self):
+        acts = run(hview(active=[held(5, 2), self.fg_on(6, 2)], take=True))
+        self.assertEqual([a for a in acts if a[0] == "stop_job"], [("stop_job", 5, "requeue")])
+
+    def test_priority_does_not_stop_a_ws_run(self):
+        acts = run(hview(queued=[dataclasses.replace(cjob(1, cores=10), priority=5)],
+                         active=[self.fg_on(6, 10)]))
+        self.assertEqual(acts, [])
+
+    def test_a_ws_run_past_its_estimate_is_not_stopped(self):
+        over = dataclasses.replace(self.fg_on(6, 4, start=5_000.0, expect=60), backfill=True)
+        self.assertEqual(run(hview(queued=[cjob(1, cores=10)], active=[over])), [])
+
+    def test_its_cores_and_memory_count(self):
+        acts = run(hview(queued=[cjob(1, cores=2, mem=8 * GB)], active=[self.fg_on(6, 9)]))
+        self.assertEqual(acts, [])  # 11 for the queue, 9 held by the run
+        acts = run(hview(queued=[cjob(1, cores=2, mem=8 * GB)], active=[self.fg_on(6, 9, kind="pytest")]))
         self.assertEqual(acts, [])
 
 
@@ -411,7 +525,7 @@ class TestEstimates(unittest.TestCase):
         self.head = cjob(1, cores=8)
 
     def go(self, later, active=None):
-        return run(hview(queued=[self.head, later], active=active or [self.busy], lease_reserve=2))
+        return run(hview(queued=[self.head, later], active=active or [self.busy], pytest_reserve=2))
 
     def test_short_job_fills_the_gap(self):
         later = dataclasses.replace(cjob(2, cores=2), expect_seconds=1800)
@@ -425,19 +539,19 @@ class TestEstimates(unittest.TestCase):
         self.assertEqual(self.go(dataclasses.replace(cjob(2, cores=2), expect_seconds=60), [unknown]), [])
 
     def test_ws_run_never_jumps_on_an_estimate(self):
-        acts = run(hview(queued=[self.head], leases=[rlease(7, cores=2, expect=60, requested=50_000)],
-                         active=[self.busy], lease_reserve=2))
+        acts = run(hview(queued=[self.head], fg=[wsrun(7, cores=2, expect=60, requested=50_000)],
+                         active=[self.busy], pytest_reserve=2))
         self.assertEqual(acts, [])
 
     def test_job_that_went_ahead_and_ran_over_makes_way(self):
         over = held(5, 4, start=5_000.0, expect=1800, backfill=True)
         busy = dataclasses.replace(self.busy, cpus=[c for core in CORES[4:8] for c in core])
-        acts = run(hview(queued=[self.head], active=[busy, over], lease_reserve=2))
+        acts = run(hview(queued=[self.head], active=[busy, over], pytest_reserve=2))
         self.assertEqual(acts, [])  # stopping it alone would not make 8 cores
-        acts = run(hview(queued=[cjob(1, cores=4)], active=[busy, over], lease_reserve=2))
+        acts = run(hview(queued=[cjob(1, cores=4)], active=[busy, over], pytest_reserve=2))
         self.assertEqual(acts, [("stop_job", 5, "requeue")])
         not_over = dataclasses.replace(over, expect_seconds=99_999)
-        self.assertEqual(run(hview(queued=[cjob(1, cores=4)], active=[busy, not_over], lease_reserve=2)), [])
+        self.assertEqual(run(hview(queued=[cjob(1, cores=4)], active=[busy, not_over], pytest_reserve=2)), [])
 
     def test_projection_is_a_timeline(self):
         from workstation_manager.scheduler import project
@@ -445,7 +559,7 @@ class TestEstimates(unittest.TestCase):
         b = dataclasses.replace(cjob(2, cores=4), expect_seconds=600)
         c = cjob(3, cores=8)
         d = cjob(4, cores=8)
-        p = project(hview(queued=[a, b, c, d], active=[self.busy], lease_reserve=2), MARGIN)
+        p = project(hview(queued=[a, b, c, d], active=[self.busy], pytest_reserve=2), MARGIN)
         self.assertEqual(p["job:9"][1], 13_600.0)
         self.assertEqual(p["job:1"][:2], (13_600.0, 17_200.0))
         self.assertEqual(p["job:2"][:2], (17_200.0, 17_800.0))
@@ -465,8 +579,8 @@ class TestEstimates(unittest.TestCase):
 class TestPriorityAcrossResources(unittest.TestCase):
     """Priority stops lower-priority running jobs for memory and cores, as for the card."""
 
-    def go(self, queued, active, leases=(), why=None, **kw):
-        return decide(hview(queued=queued, active=active, leases=leases, **kw),
+    def go(self, queued, active, fg=(), why=None, **kw):
+        return decide(hview(queued=queued, active=active, fg=fg, **kw),
                       MARGIN, 12500, 30, False, why)
 
     def hot(self, id=1, **kw):
@@ -513,20 +627,20 @@ class TestPriorityAcrossResources(unittest.TestCase):
 
     def test_ws_run_with_priority_makes_room(self):
         low = held(5, 1, mem=40 * GB)
-        acts = self.go([], [low], leases=[rlease(7, mem=16 * GB, priority=10)])
+        acts = self.go([], [low], fg=[wsrun(7, mem=16 * GB, priority=10)])
         self.assertEqual(acts, [("stop_job", 5, "requeue")])
 
     def test_overrun_stop_is_not_repeated(self):
         over = held(5, 4, start=5_000.0, expect=1800, backfill=True)
         busy = held(9, 4, start=10_000.0, expect=3600)
         busy = dataclasses.replace(busy, cpus=[c for core in CORES[4:8] for c in core])
-        acts = self.go([self.hot(cores=4)], [busy, over], lease_reserve=2)
+        acts = self.go([self.hot(cores=4)], [busy, over], pytest_reserve=2)
         self.assertEqual(acts, [("stop_job", 5, "requeue")])
 
 
 class TestMemoryPressure(unittest.TestCase):
     def started(self, acts):
-        return [a[1] for a in acts if a[0] in ("start_job", "grant_lease")]
+        return [a[1] for a in acts if a[0] == "start_job"]
 
     def stopped(self, acts):
         return [a[1] for a in acts if a[0] == "stop_job"]
@@ -540,8 +654,8 @@ class TestMemoryPressure(unittest.TestCase):
         self.assertEqual(self.started(run(v)), [1])
 
     def test_pytest_is_not_held_by_pressure(self):
-        fast = lease(7)                  # a pytest lease: the fast lane
-        v = hview(leases=[fast], pressure=(40.0, 5.0), hold=10.0, stop=20.0)
+        fast = ptest(7)                  # a pytest run: the fast lane
+        v = hview(fg=[fast], pressure=(40.0, 5.0), hold=10.0, stop=20.0)
         self.assertEqual(self.started(run(v)), [7])
 
     def test_at_the_stop_one_job_is_requeued_lowest_priority_then_newest(self):
@@ -552,6 +666,15 @@ class TestMemoryPressure(unittest.TestCase):
         acts = run(v)
         self.assertEqual(self.stopped(acts), [2])
         self.assertEqual([a for a in acts if a[0] == "stop_job"][0][2], "requeue")
+
+    def test_the_stop_never_picks_a_ws_run_or_pytest(self):
+        job = dataclasses.replace(cjob(1, status="running", cpus=[0, 12]), started_at=100.0)
+        fg = [dataclasses.replace(ptest(2, status="running", cpus=[6, 18]), started_at=300.0),
+              dataclasses.replace(wsrun(3, status="running", cpus=[1, 13]), started_at=400.0)]
+        v = hview(active=[job], fg=fg, pressure=(60.0, 25.0), hold=10.0, stop=20.0)
+        self.assertEqual(self.stopped(run(v)), [1])
+        v = hview(fg=fg, pressure=(60.0, 25.0), hold=10.0, stop=20.0)
+        self.assertEqual(self.stopped(run(v)), [])
 
     def test_one_at_a_time(self):
         going = cjob(1, status="stopping", cpus=[0, 12])

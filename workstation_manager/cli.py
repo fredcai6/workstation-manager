@@ -4,10 +4,10 @@
   ws submit --cores 4 --mem 8G [--vram 18G] [--name N] -- CMD...
   ws run [--cores 4] --mem 8G [--name N] -- CMD...   in the foreground, once it fits
   ws queue                                 broker state only
-  ws cancel ID
+  ws cancel ID                             a batch job
   ws priority ID N
   ws progress --chunk 2/4 [--pct 50]       from inside a job (uses $WS_JOB_ID)
-  ws log ID                                path of a job's log
+  ws log ID                                path of a batch job's log
   ws take / ws release                     operator override
   ws daemon                                the broker itself (systemd user unit)
 """
@@ -159,7 +159,7 @@ def _command(args, verb):
 
 
 def _never_fits(cfg, cores, mem_mib, verb) -> bool:
-    from .lease import limits
+    from .foreground import limits
     max_cores, max_mem = limits(cfg)
     if cores < 1 or cores > max_cores:
         print(f"ws {verb}: --cores {cores} can never fit (1 to {max_cores}: the physical "
@@ -203,7 +203,7 @@ def cmd_submit(args, cfg) -> int:
                           cores=args.cores, mem_mib=args.mem,
                           priority=args.priority, expect_seconds=expect)
     runner.save_env(cfg, job_id, dict(os.environ))
-    from .lease import poke
+    from .foreground import poke
     poke(cfg)
     print(f"submitted job #{job_id} ({name}, {describe(args.cores, args.mem or 0, args.vram)}, "
           f"expected {_ago_text(expect)}); log: {cfg.job_dir(job_id) / 'log'}")
@@ -215,33 +215,34 @@ def cmd_submit(args, cfg) -> int:
 
 def cmd_run(args, cfg) -> int:
     """Wait for cores and memory, then run the command here, pinned, with its memory
-    capped in a scope of its own. Inside a job or a lease it just runs."""
-    from . import lease as leases
+    capped in a scope of its own. Inside a job it just runs."""
+    from . import foreground
     argv = _command(args, "run")
     if not argv:
         return 2
-    if leases.held():
+    if foreground.held():
         os.execvp(argv[0], argv)
     if _never_fits(cfg, args.cores, args.mem, "run"):
         return 2
     expect = _expect(args, "run")
     if expect is None:
         return 2
-    unit = f"ws-run-{os.getpid()}"
+    scope = f"ws-run-{os.getpid()}"
     name = args.name or default_name(argv)
     if cfg.db_path.exists():
         hint = past_runs(_store(cfg), name)
         if hint:
             print(f"ws: {hint}", file=sys.stderr)
-    got = leases.acquire(cfg, "run", name, args.cores, args.mem, unit=unit,
-                         priority=args.priority, expect_seconds=expect)
+    got = foreground.acquire(cfg, "run", name, args.cores, args.mem, scope=scope,
+                             priority=args.priority, expect_seconds=expect, argv=argv)
     cmd = argv
     if got is not None:
-        leases.enter(got)
-        cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={unit}",
+        foreground.enter(got)
+        cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", f"--unit={scope}",
                "-p", f"MemoryMax={args.mem}M", "-p", "MemorySwapMax=0",
                *(["-p", f"AllowedCPUs={cpu.format_cpulist(got.cpus)}"] if got.cpus else []),
                "--", *argv]
+    code = None
     try:
         # Ctrl-C reaches the command through the terminal; a TERM or HUP sent to us is passed on.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -249,19 +250,25 @@ def cmd_run(args, cfg) -> int:
         for sig in (signal.SIGTERM, signal.SIGHUP):
             signal.signal(sig, lambda s, f: proc.send_signal(s))
         code = proc.wait()
+        code = 128 - code if code < 0 else code
     finally:
-        leases.release(cfg, got)
-    if code == -signal.SIGKILL and got is not None:
+        foreground.release(cfg, got, code)
+    if code == 128 + signal.SIGKILL and got is not None:
         print(f"ws run: the command was killed; if it ran past --mem {args.mem}M, "
               "raise --mem", file=sys.stderr)
-    return 128 - code if code < 0 else code
+    return code
 
 
 def cmd_cancel(args, cfg) -> int:
+    from .store import ENDED
     store = _store(cfg)
     job = store.get(args.id)
-    if job is None or job.status in ("done", "failed", "cancelled"):
+    if job is None or job.status in ENDED:
         print(f"ws cancel: no live job #{args.id}", file=sys.stderr)
+        return 1
+    if job.in_terminal:
+        print(f"ws cancel: #{job.id} is a {job.tag} in its caller's terminal (pid {job.pid}); "
+              "stop it there", file=sys.stderr)
         return 1
     store.update(job.id, stop_request="cancel")
     print(f"cancelling job #{job.id} ({job.status})")
@@ -269,14 +276,15 @@ def cmd_cancel(args, cfg) -> int:
 
 
 def cmd_priority(args, cfg) -> int:
+    from .store import ENDED
     store = _store(cfg)
     job = store.get(args.id)
-    if job is None or job.status in ("done", "failed", "cancelled"):
+    if job is None or job.status in ENDED:
         print(f"ws priority: no live job #{args.id}", file=sys.stderr)
         return 1
     store.update(job.id, priority=args.priority)
     store.event(job.id, f"priority {job.priority} -> {args.priority}")
-    from .lease import poke
+    from .foreground import poke
     poke(cfg)
     print(f"job #{job.id} ({job.name}, {job.status}) now has priority {args.priority}")
     return 0
@@ -316,6 +324,11 @@ def cmd_release(args, cfg) -> int:
 
 
 def cmd_log(args, cfg) -> int:
+    job = _store(cfg).get(args.id)
+    if job is not None and job.in_terminal:
+        print(f"ws log: #{job.id} is a {job.tag}: its output went to its caller's terminal",
+              file=sys.stderr)
+        return 1
     print(cfg.job_dir(args.id) / "log")
     return 0
 
@@ -333,7 +346,7 @@ def cmd_wrap(args, cfg) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="ws", description="Workstation manager: queue and leases for the cores, memory and GPU, and the interactive tier.")
+    parser = argparse.ArgumentParser(prog="ws", description="Workstation manager: one queue for the cores, memory and GPU, and the interactive tier.")
     sub = parser.add_subparsers(dest="command")
 
     p = sub.add_parser("status", help="Card snapshot plus broker state.")
@@ -376,7 +389,7 @@ def main(argv=None) -> int:
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p.set_defaults(fn=cmd_run)
 
-    p = sub.add_parser("cancel", help="Cancel a queued or running job.")
+    p = sub.add_parser("cancel", help="Cancel a queued or running batch job.")
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_cancel)
 
@@ -392,7 +405,7 @@ def main(argv=None) -> int:
     p.add_argument("--job", type=int)
     p.set_defaults(fn=cmd_progress)
 
-    p = sub.add_parser("log", help="Print the path of a job's log.")
+    p = sub.add_parser("log", help="Print the path of a batch job's log.")
     p.add_argument("id", type=int)
     p.set_defaults(fn=cmd_log)
 
