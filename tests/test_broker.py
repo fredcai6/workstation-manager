@@ -369,6 +369,20 @@ class TestTickPublishesModelAndSamples(Tmp):
         self.assertEqual(b["model"], "dory-4b")
         self.assertIn("estimates_summary", b)
 
+    def test_a_tick_that_swaps_the_model_never_reaches_docker(self):
+        # loaded "dory-4b" is not the config's model, so this tick swaps the llm.
+        with mock.patch("workstation_manager.interactive.subprocess.run") as run:
+            d = daemon.Daemon(self.cfg, store=self.store)
+            d.sample_at = 0
+            with mock.patch("workstation_manager.interactive.state", return_value="up"), \
+                    mock.patch("workstation_manager.interactive.loaded_model", return_value="dory-4b"), \
+                    mock.patch.object(daemon, "read_card", return_value=("card", 32624, 12000, 0)), \
+                    mock.patch.object(daemon.cpu, "memory_pressure", return_value=(3.5, 1.25)):
+                d.tick()
+            self.assertIsNotNone(d.pair_action)
+            d.pair_action.join(timeout=30)
+        run.assert_not_called()
+
     def test_sample_records_some_and_full_pressure(self):
         self.tick()
         row = self.store.db.execute("SELECT mem_pressure, mem_pressure_full FROM samples").fetchone()
