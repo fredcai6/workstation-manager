@@ -193,11 +193,13 @@ removed, say) counts as a failed attempt, not an interruption, so it is retried
   (:8006), serving chat, voice notes and tutoring clients. The model, image and
   flags come from the env file (`LLM_IMAGE`, `LLM_MODEL_FILE`, `LLM_EXTRA_ARGS`, ...);
   set `pair_vram_mib` to what the pair measures.
-- **Batch takes the card** once no assistant request (`X-GPU-Hold: 1`) has arrived for 30 minutes.
+- **Batch takes the card** once no assistant request (`X-GPU-Hold: 1`) has arrived for 30 minutes,
+  and only for a job the card is what holds up: one that doesn't fit beside the pair
+  and has its cores and memory. A job waiting on memory or cores leaves the pair up.
   The broker lets in-flight requests finish (up to 2 minutes), stops the pair, and
   runs jobs first come, first served. A later job may start beside others only if it
   doesn't delay the job at the head of the queue.
-- **The pair comes back** when the queue is empty and it fits.
+- **The pair comes back** when it fits beside the running jobs and the first job in line that needs VRAM.
 - **Switching models:** with `[models.*]` in the config, the LLM slot can run any of
   several models. The default stays resident. A request that names another model
   (by name or alias, in the JSON `"model"` field or as `?model=` on a GET such as

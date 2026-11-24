@@ -10,9 +10,12 @@ Rules, in order:
 3. Queued jobs start first-come first-served when they fit in both the measured
    free VRAM and the declared budget. A later job may start ahead of the head only
    if the head would still fit once the interactive pair is gone.
-4. If the head is still waiting, the pair is stopped for it once no interactive
-   request has arrived for `hold_minutes`.
-5. With nothing waiting, the pair comes back up when it fits, with the wanted model.
+4. If the first job in line that needs VRAM is held up by the card alone (it does not
+   fit beside the pair, would fit without it, and has its cores and memory), the pair
+   is stopped for it once no interactive request has arrived for `hold_minutes`. A job
+   waiting on memory or cores does not send the pair away.
+5. The pair comes back up, with the wanted model, when it fits beside what runs and
+   beside the first job in line that needs VRAM.
 6. When the wanted model differs from the loaded one, the llm is recreated with it
    once it fits; meanwhile no batch job starts that would keep it from fitting.
 7. In a reserve window the pair stays up with the wanted (default) model: it is
@@ -411,21 +414,29 @@ def decide(v: View, margin_mib: int, vram: Union[int, Dict[str, int]], hold_minu
                 ", ".join(f"#{a[1]}" for a in made) + " to make room"
         actions += made
 
-    # Only jobs that need the card keep the pair away or send it off.
-    waiting = [j for j in waiting if j.vram_mib > 0]
+    # Only the first job in line that needs the card keeps the pair away, and only by
+    # the VRAM it needs: the pair comes back whenever it fits beside that job too.
+    # The pair is sent off only when the card is what holds that job up: it does not
+    # fit beside the pair, would fit without it, and has the cores and memory to start.
+    # A job waiting on memory or cores keeps the pair up (11-23: a 3.2 GB job waiting
+    # on memory sent the pair away at the end of the reserve window and kept it down).
+    first = next((j for j in waiting if j.vram_mib > 0), None)
+    need = first.vram_mib if first else 0
     if v.reserved:
         if v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
             actions.append(("start_pair", want))
-    elif waiting:
-        first = waiting[0]
+    elif v.pair == "down":
+        if cap - committed - need >= want_mib and free - need >= want_mib:
+            actions.append(("start_pair", want))
+    elif first is not None and v.pair == "up":
         idle_min = (v.now - v.last_interactive_at) / 60.0
-        if v.pair == "up" and not swap_blocked and first.vram_mib <= cap - committed \
-                and idle_min >= hold_minutes and ("swap_model", want) not in actions:
+        card_bound = first.vram_mib > min(room, free) and first.vram_mib <= cap - committed \
+            and not host.shortfall(first)
+        if card_bound and not swap_blocked and idle_min >= hold_minutes \
+                and ("swap_model", want) not in actions:
             actions.append(("stop_pair",))
-        elif v.pair == "up" and idle_min < hold_minutes and f"job:{first.id}" in why:
+        elif card_bound and idle_min < hold_minutes and f"job:{first.id}" in why:
             why[f"job:{first.id}"] += f"; the pair is held for {hold_minutes - idle_min:.0f} more min"
-    elif v.pair == "down" and cap - committed >= want_mib and free >= want_mib:
-        actions.append(("start_pair", want))
     stopped: set = set()
     out = []
     for a in actions:                   # one stop per job, the first reason given

@@ -169,6 +169,34 @@ class TestCpuJobsAndTheCard(unittest.TestCase):
         self.assertEqual(acts, [])
 
 
+class TestGpuJobsWaitingOnMemory(unittest.TestCase):
+    """11-23: a 3.2 GB GPU job waiting on memory sent the pair away and kept it down."""
+    RUNNING = dataclasses.replace(cjob(1, cores=2, mem=24 * GB, vram=3300, status="running",
+                                       cpus=[0, 12]), started_at=1.0)
+
+    def v(self, vram, pair="up", avail=14 * GB):
+        v = hview(queued=[cjob(2, cores=2, mem=24 * GB, vram=vram)], active=[self.RUNNING],
+                  pair=pair, avail=avail)
+        v.last_interactive_at = 0.0          # hold long over
+        return v
+
+    def test_small_job_waiting_on_memory_keeps_the_pair(self):
+        self.assertEqual(run(self.v(3300)), [])
+
+    def test_pair_comes_back_beside_a_small_job_waiting_on_memory(self):
+        self.assertEqual(run(self.v(3300, pair="down")), [("start_pair", "default")])
+
+    def test_small_job_starts_beside_the_pair_once_memory_frees(self):
+        self.assertEqual([a[:2] for a in run(self.v(3300, avail=40 * GB))], [("start_job", 2)])
+
+    def test_big_job_waiting_on_memory_keeps_the_pair_until_memory_frees(self):
+        self.assertEqual(run(self.v(20000)), [])
+        self.assertEqual(run(self.v(20000, avail=40 * GB)), [("stop_pair",)])
+
+    def test_pair_stays_down_when_it_would_not_fit_beside_the_first_in_line(self):
+        self.assertEqual(run(self.v(20000, pair="down")), [])
+
+
 class TestLeases(unittest.TestCase):
     def test_lease_is_granted_despite_unmanaged_load(self):
         acts = run(hview(queued=[cjob(1)], leases=[lease(7)], busy=[1.0] * 12))
